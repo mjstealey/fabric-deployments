@@ -29,8 +29,8 @@ live under `deploy/` in this same project:
   (submit/CM + `--workers N` execute nodes), wires the inter-slice route, and
   bootstraps the stack.
 - `../../deploy/pegasus-htcondor/bootstrap_pegasus_node.sh` — role-aware in-VM
-  bring-up (HTCondor + shared pool key on every node; Pegasus everywhere;
-  workflow-monitor + Vector on the submit node).
+  bring-up (HTCondor + shared pool key on every node; Pegasus + Apptainer
+  everywhere; workflow-monitor + Vector on the submit node).
 - `../../deploy/pegasus-htcondor/condor/` — the HTCondor config drop-ins.
 - `../../deploy/pegasus-htcondor/vector/vector.toml.tmpl` — the node Vector config.
 - `../../deploy/pegasus-htcondor/examples/diamond.py` — the smoke-test workflow.
@@ -71,6 +71,17 @@ ELASTIC_INGEST_PASSWORD=… uv run python recipes/pegasus-htcondor/provision.py 
 # 4. Smoke-test end to end: plan+submit a diamond, run workflow-monitor.
 uv run python recipes/pegasus-htcondor/provision.py \
     --name pegasus-htcondor --run-example
+
+# 5. Run a real (containerized) workflow — clone, generate, plan+submit, monitor.
+#    Apptainer is already on the workers; condorio is forced; the submit dir lands
+#    under the runs root so Vector ships it. No changes on the ES side.
+ELASTIC_INGEST_PASSWORD=… uv run python recipes/pegasus-htcondor/provision.py \
+    --name pegasus-htcondor \
+    --run-workflow https://github.com/pegasus-isi/earthquake-workflow.git \
+    --generate-cmd "./workflow_generator.py --regions california \
+        --start-date 1994-01-01 --end-date 1994-01-31 --min-magnitude 3.0 \
+        -o workflow.yml" \
+    --workflow-file workflow.yml --run-name earthquake-run
 
 # Infra + routing only (inspect before installing the stack):
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor

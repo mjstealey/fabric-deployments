@@ -28,6 +28,9 @@ What it does
              start Vector on the submit node
   example    (--run-example) plan+submit a tiny diamond workflow under
              workflow-monitor as an end-to-end smoke test
+  workflow   (--run-workflow URL|DIR) clone/use a real workflow, optionally
+             generate it (--generate-cmd), plan+submit it (forcing condorio so
+             the no-shared-fs pool works), and start workflow-monitor
 
 Usage
 -----
@@ -388,23 +391,45 @@ def wire_es(slice_obj, args):
 # ---------------------------------------------------------------------------
 
 
-def run_example(slice_obj, args):
-    print("==> running the diamond smoke-test workflow")
-    submit = slice_obj.get_node(args.submit_node)
-    runs = args.runs_dir
-    sub_dir = f"{runs}/submit/diamond-run"
-
-    # Generate the abstract workflow + catalogs, then plan with a deterministic
-    # submit dir so we can point workflow-monitor straight at it.
-    submit.execute(
-        f"cd {runs} && python3 ~/{REMOTE_DIR}/examples/diamond.py 2>&1 | tail -30"
+def _looks_like_git(src):
+    """True if src should be `git clone`d rather than treated as an existing dir."""
+    return src.endswith(".git") or src.startswith(
+        ("http://", "https://", "git@", "ssh://", "git://")
     )
-    out, err = submit.execute(
-        f"cd {runs} && rm -rf {sub_dir} && "
+
+
+def _workflow_basename(src):
+    """Repo/dir name from a git URL or path (trailing slash and .git stripped)."""
+    name = src.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name or "workflow"
+
+
+def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condorio"):
+    """Plan+submit wf_file from workdir into runs/submit/<run_name>, then monitor.
+
+    Shared tail of --run-example and --run-workflow. Ensures a no-shared-fs data
+    configuration is set (the pool has no shared filesystem, so the Pegasus
+    default 'sharedfs' would fail), plans with a deterministic submit dir under
+    the runs root, and launches a headless workflow-monitor whose JSONL Vector is
+    already tailing. Returns the submit dir.
+    """
+    sub_dir = f"{runs}/submit/{run_name}"
+    # Force the pool's data config unless the workflow already chose one. Workers
+    # cannot see the submit node's filesystem, so 'sharedfs' (the Pegasus default)
+    # must not win by omission.
+    submit.execute(
+        f"cd {workdir} && touch pegasus.properties && "
+        "grep -q '^pegasus.data.configuration' pegasus.properties || "
+        f"printf 'pegasus.data.configuration=%s\\n' {data_conf} >> pegasus.properties"
+    )
+    out, _ = submit.execute(
+        f"cd {workdir} && rm -rf {sub_dir} && "
         "pegasus-plan --conf pegasus.properties "
-        f"--dir {runs}/submit --relative-submit-dir diamond-run "
+        f"--dir {runs}/submit --relative-submit-dir {run_name} "
         "--sites condorpool --output-sites local --cleanup leaf "
-        "--submit diamond-workflow.yml 2>&1 | tail -40"
+        f"--submit {wf_file} 2>&1 | tail -40"
     )
     print(out)
     # Headless monitor: writes workflow-events.jsonl + diagnostics-events.jsonl
@@ -418,17 +443,86 @@ def run_example(slice_obj, args):
         # for it (up to ~60s) before launching the monitor.
         f"for i in $(seq 1 30); do ls {sub_dir}/*.stampede.db >/dev/null 2>&1 && break; sleep 2; done; "
         f"nohup workflow-monitor {sub_dir} --serve --diagnose --log "
-        f">{runs}/monitor.out 2>&1 & sleep 8; "
+        f">{runs}/monitor-{run_name}.out 2>&1 & sleep 8; "
         f"ls -l {sub_dir}/workflow-events.jsonl 2>/dev/null || "
-        "echo 'no JSONL yet — check pegasus-monitord / workflow-monitor.out'"
+        "echo 'no JSONL yet — check pegasus-monitord / workflow-monitor output'"
     )
-    print(
+    return sub_dir
+
+
+def _watch_hint(sub_dir, es_host):
+    return (
         "  submitted. Watch progress on the submit node:\n"
         f"    condor_q ; pegasus-status -l {sub_dir}\n"
         "  and confirm docs land in ES:\n"
         "    curl --cacert /etc/vector/ca.crt -u vector_ingest:$ELASTIC_INGEST_PASSWORD \\\n"
-        f"      https://{args.es_host}:9200/workflow-events-*/_count?pretty"
+        f"      https://{es_host}:9200/workflow-events-*/_count?pretty"
     )
+
+
+def run_example(slice_obj, args):
+    print("==> running the diamond smoke-test workflow")
+    submit = slice_obj.get_node(args.submit_node)
+    runs = args.runs_dir
+    # Generate the abstract workflow + catalogs in the runs dir; diamond.py sets
+    # condorio itself, so _plan_and_monitor's guard leaves it intact.
+    submit.execute(
+        f"cd {runs} && python3 ~/{REMOTE_DIR}/examples/diamond.py 2>&1 | tail -30"
+    )
+    sub_dir = _plan_and_monitor(
+        submit, runs, "diamond-run", runs, "diamond-workflow.yml"
+    )
+    print(_watch_hint(sub_dir, args.es_host))
+
+
+def run_workflow(slice_obj, args):
+    """Clone/use a real workflow on the submit node, generate it, plan+submit, monitor.
+
+    Generic sibling of run_example. --run-workflow is a git URL (cloned under the
+    runs root) or an existing submit-node directory. --generate-cmd (optional)
+    runs inside that dir to emit the abstract workflow + catalogs; then we plan
+    with a deterministic submit dir and start workflow-monitor. Containerized
+    workflows need a container runtime on the workers — the bootstrap installs
+    Apptainer unless INSTALL_APPTAINER=0.
+    """
+    submit = slice_obj.get_node(args.submit_node)
+    runs = args.runs_dir
+    source = args.run_workflow
+    run_name = args.run_name or f"{_workflow_basename(source)}-run"
+
+    if _looks_like_git(source):
+        workdir = args.workflow_dir or f"{runs}/{_workflow_basename(source)}"
+        print(f"==> cloning {source} -> {workdir}")
+        out, _ = submit.execute(
+            f"rm -rf {workdir} && git clone --depth 1 {source} {workdir} 2>&1 | tail -5"
+        )
+        print(out)
+    else:
+        workdir = args.workflow_dir or source
+        check, _ = submit.execute(f"test -d {workdir} && echo OK || echo MISSING")
+        if "MISSING" in check:
+            sys.exit(
+                f"error: --run-workflow {source!r} is not a git URL and no such "
+                f"directory exists on the submit node ({workdir}). Pass a git URL, "
+                "or a path that already exists on the submit node."
+            )
+        print(f"==> using existing workflow dir {workdir}")
+
+    if args.generate_cmd:
+        print(f"==> generating workflow: {args.generate_cmd}")
+        out, _ = submit.execute(
+            'export PATH="$HOME/.local/bin:$PATH"; '
+            f"cd {workdir} && {args.generate_cmd} 2>&1 | tail -30"
+        )
+        print(out)
+
+    print(
+        f"==> planning {args.workflow_file} from {workdir} (data_conf={args.data_configuration})"
+    )
+    sub_dir = _plan_and_monitor(
+        submit, runs, run_name, workdir, args.workflow_file, args.data_configuration
+    )
+    print(_watch_hint(sub_dir, args.es_host))
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +654,44 @@ def parse_args(argv=None):
     p.add_argument(
         "--run-example", action="store_true", help="plan+submit the diamond smoke test"
     )
+
+    # Generic workflow runner (post-hoc; the pool must already be bootstrapped).
+    p.add_argument(
+        "--run-workflow",
+        default=None,
+        metavar="GIT_URL_OR_DIR",
+        help="clone (git URL) or use (existing submit-node dir) a workflow, "
+        "generate + plan + submit it, and start workflow-monitor",
+    )
+    p.add_argument(
+        "--generate-cmd",
+        default=None,
+        metavar="CMD",
+        help="command run inside the workflow dir to emit the abstract workflow + "
+        'catalogs (e.g. "./workflow_generator.py --regions california ... -o workflow.yml")',
+    )
+    p.add_argument(
+        "--workflow-file",
+        default="workflow.yml",
+        help="abstract workflow YAML (in the workflow dir) to plan",
+    )
+    p.add_argument(
+        "--workflow-dir",
+        default=None,
+        help="submit-node working dir for the clone/checkout (default: <runs-dir>/<name>)",
+    )
+    p.add_argument(
+        "--run-name",
+        default=None,
+        help="relative submit-dir name under <runs-dir>/submit (default: <name>-run)",
+    )
+    p.add_argument(
+        "--data-configuration",
+        default="condorio",
+        choices=["condorio", "nonsharedfs", "sharedfs"],
+        help="pegasus.data.configuration to ensure (the FABRIC pool has no shared FS)",
+    )
+
     p.add_argument(
         "--reconfigure",
         action="store_true",
@@ -582,12 +714,14 @@ def main(argv=None):
 
     # Post-hoc actions operate on the EXISTING slice (the ES slice must already
     # be up for these), so they never rebuild.
-    if args.wire_es or args.run_example:
+    if args.wire_es or args.run_example or args.run_workflow:
         slice_obj = fablib.get_slice(args.name)
         if args.wire_es:
             wire_es(slice_obj, args)
         if args.run_example:
             run_example(slice_obj, args)
+        if args.run_workflow:
+            run_workflow(slice_obj, args)
         return
 
     # Fresh build.

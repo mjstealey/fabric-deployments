@@ -27,9 +27,9 @@ This is the slice the `elastic-stack` recipe assumed already existed (its
 >   the inter-slice route, bootstraps the stack, wires Vector to ES, runs a
 >   smoke test.
 > - `pegasus-htcondor/bootstrap_pegasus_node.sh` — the role-aware in-VM bring-up
->   the script uploads and runs (HTCondor + pool key on every node, Pegasus
->   everywhere, workflow-monitor + Vector on the submit node). Also runnable by
->   hand.
+>   the script uploads and runs (HTCondor + pool key on every node, Pegasus +
+>   Apptainer everywhere, workflow-monitor + Vector on the submit node). Also
+>   runnable by hand.
 > - `pegasus-htcondor/condor/` — the HTCondor config drop-ins.
 > - `pegasus-htcondor/vector/vector.toml.tmpl` — the node Vector config.
 > - `pegasus-htcondor/examples/diamond.py` — the smoke-test workflow.
@@ -118,8 +118,9 @@ What step 1 (`--bootstrap`) does, per node, in order:
    role-aware:
    - **every node:** installs HTCondor, renders the config drop-ins
      (`CONDOR_HOST`, the node's own bind IP, the FABNet subnet for `ALLOW_*`),
-     stores the **shared pool signing key**, and installs Pegasus (for
-     `pegasus-keg` + the worker tools).
+     stores the **shared pool signing key**, installs Pegasus (for `pegasus-keg`
+     + the worker tools), and installs **Apptainer** as the container runtime
+     for containerized workflows (`INSTALL_APPTAINER=0` to skip).
    - **submit node only:** also prepares the runs dir, installs `workflow-monitor`,
      and installs Vector + renders `vector.toml` (left **stopped** — no CA/.env
      yet).
@@ -128,6 +129,50 @@ Steps 3 (`--wire-es`) and 4 (`--run-example`) operate on the existing slice.
 
 The rest of this document explains each step so you can run it by hand, adapt
 it, or debug it.
+
+---
+
+## Running a real (containerized) workflow
+
+`--run-example` is the diamond smoke test. To run an arbitrary workflow — e.g.
+the [earthquake-workflow](https://github.com/pegasus-isi/earthquake-workflow),
+whose every job runs inside `docker://kthare10/earthquake-analysis:latest` — use
+`--run-workflow`. It clones the repo onto the submit node under the runs root,
+optionally runs a generator to emit the abstract workflow + catalogs, forces a
+no-shared-fs data configuration, plans+submits against `condorpool`, and starts
+`workflow-monitor` so events flow to ES exactly like the smoke test:
+
+```bash
+ELASTIC_INGEST_PASSWORD=… uv run python recipes/pegasus-htcondor/provision.py \
+    --name pegasus-htcondor \
+    --run-workflow https://github.com/pegasus-isi/earthquake-workflow.git \
+    --generate-cmd "./workflow_generator.py --regions california \
+        --start-date 1994-01-01 --end-date 1994-01-31 --min-magnitude 3.0 \
+        -o workflow.yml" \
+    --workflow-file workflow.yml --run-name earthquake-run
+```
+
+What it relies on, and the knobs:
+
+- **A container runtime on the workers.** The bootstrap installs Apptainer on
+  every node (above); without it, containerized jobs cannot run. Workers pull
+  the image from Docker Hub over the management NIC at first use.
+- **`condorio` (the default `--data-configuration`).** The pool has no shared
+  filesystem, so the Pegasus default `sharedfs` would fail. `--run-workflow`
+  appends `pegasus.data.configuration=condorio` to the generated
+  `pegasus.properties` **unless the workflow already set one**. Override with
+  `--data-configuration nonsharedfs|sharedfs`.
+- **The submit dir lands under the runs root**
+  (`/opt/workflows/submit/<run-name>`), which is what Vector tails — so
+  monitoring needs zero extra wiring.
+- `--run-workflow` also accepts a **directory already on the submit node**
+  (instead of a git URL); `--workflow-dir` overrides the clone/checkout
+  location, and `--generate-cmd` is optional (skip it when the workflow YAML
+  already exists in the dir).
+
+> The receiver side never changes. The ES index templates and Vector transforms
+> are workflow-agnostic — any workflow whose `workflow-monitor` JSONL lands under
+> the runs root is ingested. See [`README.md`](README.md) and [`FABRIC.md`](FABRIC.md).
 
 ---
 
@@ -221,6 +266,26 @@ condor_status -schedd    # the submit schedd
 (`pegasus-plan` / `pegasus-run`); the execute nodes need `pegasus-keg` and the
 worker tools (`pegasus-kickstart`, `pegasus-transfer`) because the smoke
 workflow uses `condorio` with `installed` transformations.
+
+### 5b. Install a container runtime (every node)
+
+The Pegasus package pulls in **no** container runtime, but containerized
+workflows (transformations with a `Container`, e.g. the earthquake-workflow's
+`docker://…` image) run via **Apptainer/Singularity** on the execute nodes. The
+bootstrap installs Apptainer from the `ppa:apptainer/ppa` PPA (falling back to
+the release `.deb`) and adds a `singularity` compat symlink. By hand:
+
+```bash
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository -y ppa:apptainer/ppa
+sudo apt-get update -y && sudo apt-get install -y apptainer
+command -v singularity || sudo ln -sf "$(command -v apptainer)" /usr/local/bin/singularity
+```
+
+The workers pull the image from Docker Hub over the management NIC at first use,
+so the diamond smoke test (no container) works even if this step is skipped —
+but a containerized workflow will not. Skip it in the bootstrap with
+`INSTALL_APPTAINER=0`.
 
 ### 6. Run workflow-monitor + Vector (submit node)
 

@@ -20,6 +20,7 @@
 #   FABNET_CIDR            pool subnet for host authorization          (CONDOR_HOST/24)
 #   POOL_PASSWORD          shared pool signing key                     REQUIRED
 #   PEGASUS_VERSION        Pegasus apt version (best-effort)           (5.1.2)
+#   INSTALL_APPTAINER      install Apptainer container runtime         (1; 0 to skip)
 #   PEG_DIR                uploaded asset dir                          ($HOME/pegasus-htcondor)
 #   RUNS_DIR              (cm) absolute submit-dir root                (/opt/workflows)
 #   ES_HOST              (cm) ES hostname baked into vector.toml       (workflow-monitor-es)
@@ -38,6 +39,10 @@ RUNS_DIR="${RUNS_DIR:-/opt/workflows}"
 ES_HOST="${ES_HOST:-workflow-monitor-es}"
 WORKFLOW_MONITOR_SPEC="${WORKFLOW_MONITOR_SPEC:-git+https://github.com/pegasus-isi/workflow-monitor.git}"
 INSTALL_VECTOR="${INSTALL_VECTOR:-}"
+# Container runtime (every node). Pegasus runs containerized transformations via
+# singularity/apptainer on the EXECUTE nodes; the Pegasus package pulls in none.
+INSTALL_APPTAINER="${INSTALL_APPTAINER:-1}"
+APPTAINER_DEB_URL="${APPTAINER_DEB_URL:-https://github.com/apptainer/apptainer/releases/download/v1.3.6/apptainer_1.3.6_amd64.deb}"
 # Vector apt setup script (Datadog-era; the old repositories.timber.io host is
 # dead). Fallback: the GitHub release .deb if the repo is unreachable.
 VECTOR_SETUP_URL="${VECTOR_SETUP_URL:-https://setup.vector.dev}"
@@ -104,6 +109,37 @@ if ! command -v pegasus-version >/dev/null 2>&1; then
   sudo apt-get install -y "pegasus=${PEGASUS_VERSION}-1+${CODENAME}" \
     || sudo apt-get install -y pegasus \
     || echo "  ! Pegasus apt install failed; see PEGASUS-HTCONDOR.md for alternatives"
+fi
+
+# --- 4b. Apptainer (container runtime, ALL nodes) --------------------------
+# Containerized Pegasus transformations (e.g. earthquake-workflow's
+# docker://kthare10/earthquake-analysis image) run via singularity/apptainer on
+# the EXECUTE nodes. Install Apptainer here on every node; opt out with
+# INSTALL_APPTAINER=0. Non-fatal: a pool that runs only non-container workflows
+# still comes up if this hiccups (same `if`-not-`set -e` pattern as Vector).
+if [ "${INSTALL_APPTAINER}" != "0" ] && ! command -v apptainer >/dev/null 2>&1; then
+  log "installing Apptainer (container runtime)"
+  if sudo apt-get install -y software-properties-common \
+     && sudo add-apt-repository -y ppa:apptainer/ppa \
+     && sudo apt-get update -y \
+     && sudo apt-get install -y apptainer; then :
+  else
+    log "Apptainer PPA unavailable; falling back to the release .deb"
+    if curl -fsSLo /tmp/apptainer.deb "${APPTAINER_DEB_URL}"; then
+      sudo apt-get install -y /tmp/apptainer.deb || sudo dpkg -i /tmp/apptainer.deb || true
+    fi
+  fi
+  # Pegasus 5.1 detects apptainer, but some code paths still probe for the
+  # `singularity` name; add a compat shim if only the apptainer binary exists.
+  if command -v apptainer >/dev/null 2>&1 && ! command -v singularity >/dev/null 2>&1; then
+    sudo ln -sf "$(command -v apptainer)" /usr/local/bin/singularity
+  fi
+  if command -v apptainer >/dev/null 2>&1; then
+    echo "  apptainer: $(apptainer --version 2>/dev/null)"
+  else
+    echo "  ! Apptainer install FAILED (PPA + .deb both unreachable); containerized"
+    echo "    jobs will not run on this node. The pool itself is unaffected."
+  fi
 fi
 
 if [ "${ROLE}" != "cm" ]; then
