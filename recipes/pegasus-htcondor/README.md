@@ -83,6 +83,10 @@ ELASTIC_INGEST_PASSWORD=… uv run python recipes/pegasus-htcondor/provision.py 
         -o workflow.yml" \
     --workflow-file workflow.yml --run-name earthquake-run
 
+# Retrofit the Apptainer container runtime onto an existing pool (built before
+# it was part of the bootstrap). Idempotent, no condor restart — safe while live.
+uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor --install-apptainer
+
 # Infra + routing only (inspect before installing the stack):
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor
 

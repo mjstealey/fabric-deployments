@@ -22,8 +22,10 @@ What it does
              never touching the management default route
   bootstrap  (--bootstrap) upload + run bootstrap_pegasus_node.sh on every node:
              install HTCondor (role-aware), share a pool signing key, install
-             Pegasus everywhere, and on the submit node install workflow-monitor
-             + Vector (Vector stays stopped until --wire-es)
+             Pegasus + Apptainer everywhere, and on the submit node install
+             workflow-monitor + Vector (Vector stays stopped until --wire-es)
+  apptainer  (--install-apptainer) retrofit just the container runtime onto an
+             existing slice (idempotent, no condor restart -- safe on a live pool)
   wire-es    (--wire-es) upload the ES slice's CA, finalize the Vector sink, and
              start Vector on the submit node
   example    (--run-example) plan+submit a tiny diamond workflow under
@@ -82,6 +84,7 @@ DEFAULT_ES_HOSTNAME = "workflow-monitor-es"  # matches the ES cert SAN + /etc/ho
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PEG_DIR = REPO_ROOT / "deploy" / "pegasus-htcondor"
 BOOTSTRAP_SH = PEG_DIR / "bootstrap_pegasus_node.sh"
+APPTAINER_SH = PEG_DIR / "install_apptainer.sh"
 CONDOR_DIR = PEG_DIR / "condor"
 VECTOR_TMPL = PEG_DIR / "vector" / "vector.toml.tmpl"
 VECTOR_SERVICE = REPO_ROOT / "deploy" / "vector" / "vector.service"
@@ -290,6 +293,10 @@ def _upload_assets(node, *, with_submit_assets):
         f"mkdir -p ~/{REMOTE_DIR}/condor ~/{REMOTE_DIR}/vector ~/{REMOTE_DIR}/examples"
     )
     node.upload_file(str(BOOTSTRAP_SH), f"{REMOTE_DIR}/bootstrap_pegasus_node.sh")
+    # Container runtime install, shared with --install-apptainer (every node).
+    if not APPTAINER_SH.exists():
+        sys.exit(f"error: {APPTAINER_SH} not found")
+    node.upload_file(str(APPTAINER_SH), f"{REMOTE_DIR}/install_apptainer.sh")
     for fname in CONDOR_FILES:
         local = CONDOR_DIR / fname
         if not local.exists():
@@ -346,6 +353,30 @@ def bootstrap_pool(slice_obj, submit_ip, fabnet_cidr, args):
         "  pool bootstrap complete; on the submit node `condor_status` should "
         "list the execute nodes once they advertise."
     )
+
+
+def install_apptainer(slice_obj, args):
+    """Retrofit the container runtime onto every node of an existing slice.
+
+    For pools bootstrapped before Apptainer was part of the bring-up. Uploads and
+    runs install_apptainer.sh (the same script the bootstrap uses) on each node:
+    idempotent, no condor restart, safe on a running pool. After this, the worker
+    nodes can run containerized workflows (e.g. via --run-workflow).
+    """
+    if not APPTAINER_SH.exists():
+        sys.exit(f"error: {APPTAINER_SH} not found")
+    print("==> installing Apptainer on every node of the existing slice")
+    for node in slice_obj.get_nodes():
+        name = node.get_name()
+        node.execute(f"mkdir -p ~/{REMOTE_DIR}")
+        node.upload_file(str(APPTAINER_SH), f"{REMOTE_DIR}/install_apptainer.sh")
+        print(f"  -> {name}")
+        out, _ = node.execute(
+            f"chmod +x ~/{REMOTE_DIR}/install_apptainer.sh && "
+            f"INSTALL_APPTAINER=1 bash ~/{REMOTE_DIR}/install_apptainer.sh 2>&1 | tail -15"
+        )
+        print(out)
+    print("  done. Verify on a worker:  apptainer --version")
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +724,12 @@ def parse_args(argv=None):
     )
 
     p.add_argument(
+        "--install-apptainer",
+        action="store_true",
+        help="retrofit the Apptainer container runtime onto every node of an "
+        "existing slice (idempotent, no condor restart)",
+    )
+    p.add_argument(
         "--reconfigure",
         action="store_true",
         help="re-apply data-plane IPs + route + restart condor (post-reboot)",
@@ -714,8 +751,10 @@ def main(argv=None):
 
     # Post-hoc actions operate on the EXISTING slice (the ES slice must already
     # be up for these), so they never rebuild.
-    if args.wire_es or args.run_example or args.run_workflow:
+    if args.wire_es or args.run_example or args.run_workflow or args.install_apptainer:
         slice_obj = fablib.get_slice(args.name)
+        if args.install_apptainer:
+            install_apptainer(slice_obj, args)
         if args.wire_es:
             wire_es(slice_obj, args)
         if args.run_example:

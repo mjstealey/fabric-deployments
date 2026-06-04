@@ -285,7 +285,8 @@ command -v singularity || sudo ln -sf "$(command -v apptainer)" /usr/local/bin/s
 The workers pull the image from Docker Hub over the management NIC at first use,
 so the diamond smoke test (no container) works even if this step is skipped —
 but a containerized workflow will not. Skip it in the bootstrap with
-`INSTALL_APPTAINER=0`.
+`INSTALL_APPTAINER=0`. On an **already-running** pool, retrofit it on every node
+with `--install-apptainer` (see Operational notes) instead of doing it by hand.
 
 ### 6. Run workflow-monitor + Vector (submit node)
 
@@ -350,6 +351,15 @@ reference.
 - **Scaling the pool:** raise `--workers` on a fresh build, or add nodes to the
   slice and re-run the bootstrap with the saved `.pool-password` so the new
   workers share the pool key.
+- **Retrofitting the container runtime.** A pool built before Apptainer was part
+  of the bring-up can get it without a rebuild: `--install-apptainer` uploads and
+  runs `install_apptainer.sh` on every node. It is idempotent and does **not**
+  restart condor, so it is safe on a running pool:
+  ```bash
+  uv run python recipes/pegasus-htcondor/provision.py \
+      --name pegasus-htcondor --install-apptainer
+  ```
+  (`--run-workflow` itself needs nothing on the slice — it is driver-side.)
 - **Multiple producer slices → one ES.** Each pool ships to the same
   `workflow-monitor-es` over its own FABNet route; ES is the shared sink. Switch
   Vector to **API keys** (one per submit host) so any one can be revoked
@@ -363,10 +373,11 @@ reference.
 deploy/
 ├── PEGASUS-HTCONDOR.md           # ← you are here
 ├── fabric/
-│   ├── provision_pegasus_slice.py  # FABlib: create pool, route, bootstrap, wire-es, example
+│   ├── provision_pegasus_slice.py  # FABlib: create pool, route, bootstrap, apptainer, wire-es, run
 │   └── ca.crt                       # the ES CA, downloaded by the elastic-stack recipe (gitignored)
 └── pegasus-htcondor/
     ├── bootstrap_pegasus_node.sh    # role-aware in-VM bring-up (uploaded + run by ↑)
+    ├── install_apptainer.sh         # container-runtime install (bootstrap + --install-apptainer)
     ├── .pool-password               # generated shared pool key (gitignored)
     ├── condor/                      # HTCondor config drop-ins (rendered per node)
     ├── vector/vector.toml.tmpl      # node Vector config (rendered to /etc/vector/vector.toml)
