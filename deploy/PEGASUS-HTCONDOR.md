@@ -176,6 +176,55 @@ What it relies on, and the knobs:
 
 ---
 
+## Monitor a run remotely (`workflow-monitor --remote`)
+
+`workflow-monitor` is a terminal UI, and it can attach to a run **from your
+laptop over SSH** — no port-forward, no web server. Its `--remote` mode re-fetches
+the run's `workflow-events.jsonl` through the FABRIC bastion every few seconds and
+replays it into the TUI locally. `--run-workflow` already starts the submit-node
+`--serve` daemon that keeps that JSONL fresh, so a live run streams and a finished
+run shows its final state.
+
+```bash
+# Have the tool locally — from a checkout (cd <workflow-monitor>; uv run …) or:
+uv tool install "git+https://github.com/pegasus-isi/workflow-monitor.git"
+
+workflow-monitor \
+  --remote 'ubuntu@[<submit-mgmt-ipv6>]:/opt/workflows/submit/<run-name>/workflow-events.jsonl' \
+  --ssh-config   ~/.ssh/fabric-ssh-config \
+  --ssh-identity ~/.ssh/fabric-sliver
+```
+
+- **Target the run's event log**, `<runs-dir>/submit/<run-name>/workflow-events.jsonl`
+  (default runs-dir `/opt/workflows`; `<run-name>` is the `--run-name` you passed,
+  e.g. `earthquake-run`). The clone/workdir `/opt/workflows/<repo>` has **no** JSONL —
+  the submit dir does. Unsure? `ssh … 'ls /opt/workflows/submit/*/workflow-events.jsonl'`.
+- **The submit node's management IP is IPv6**, so the host needs **square
+  brackets**: `ubuntu@[2001:…]:…`. Get it with
+  `slice.get_node("submit").get_management_ip()` (or `get_ssh_command()`).
+- **`--ssh-config`** is your FABRIC SSH config — its `ProxyJump` does the bastion
+  hop; **`--ssh-identity`** is the sliver key for the node. Your laptop only needs
+  to reach the bastion; the bastion reaches the node's IPv6.
+- **Live vs. done:** the command above shows a completed run's final state; add
+  `--once` for a one-shot snapshot, or run it (no `--once`) right after
+  `--run-workflow` to watch jobs go `IDLE → RUNNING → SUCCEEDED` (refresh every
+  `--sync-interval`, default 5s). For container-planned workflows the default
+  `--remap-submit-dir auto` rebases paths; pass `always` if the job table looks off.
+
+It is read-only and safe alongside the running `--serve` daemon.
+
+> **Richer live view — run the TUI *on* the submit node.** SSH in and run it there
+> to also query the live HTCondor queue (idle-job reasons, etc.), at the cost of
+> staying connected:
+>
+> ```bash
+> ssh -F ~/.ssh/fabric-ssh-config -i ~/.ssh/fabric-sliver ubuntu@'[<submit-mgmt-ipv6>]'
+> export PATH=$HOME/.local/bin:$PATH
+> workflow-monitor /opt/workflows/submit/<run-name>      # --why-idle explains stalls
+> ```
+
+---
+
 ## Manual path
 
 ### 1. Create the pool slice
