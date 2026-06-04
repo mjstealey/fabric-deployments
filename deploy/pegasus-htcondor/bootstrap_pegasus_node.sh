@@ -20,6 +20,7 @@
 #   FABNET_CIDR            pool subnet for host authorization          (CONDOR_HOST/24)
 #   POOL_PASSWORD          shared pool signing key                     REQUIRED
 #   PEGASUS_VERSION        Pegasus apt version (best-effort)           (5.1.2)
+#   INSTALL_APPTAINER      install Apptainer container runtime         (1; 0 to skip)
 #   PEG_DIR                uploaded asset dir                          ($HOME/pegasus-htcondor)
 #   RUNS_DIR              (cm) absolute submit-dir root                (/opt/workflows)
 #   ES_HOST              (cm) ES hostname baked into vector.toml       (workflow-monitor-es)
@@ -38,6 +39,11 @@ RUNS_DIR="${RUNS_DIR:-/opt/workflows}"
 ES_HOST="${ES_HOST:-workflow-monitor-es}"
 WORKFLOW_MONITOR_SPEC="${WORKFLOW_MONITOR_SPEC:-git+https://github.com/pegasus-isi/workflow-monitor.git}"
 INSTALL_VECTOR="${INSTALL_VECTOR:-}"
+# Container runtime (every node): Pegasus runs containerized transformations via
+# singularity/apptainer on the EXECUTE nodes, but its package pulls in none. The
+# install itself lives in install_apptainer.sh (shared with --install-apptainer);
+# INSTALL_APPTAINER=0 skips it, APPTAINER_DEB_URL overrides the .deb fallback.
+INSTALL_APPTAINER="${INSTALL_APPTAINER:-1}"
 # Vector apt setup script (Datadog-era; the old repositories.timber.io host is
 # dead). Fallback: the GitHub release .deb if the repo is unreachable.
 VECTOR_SETUP_URL="${VECTOR_SETUP_URL:-https://setup.vector.dev}"
@@ -105,6 +111,17 @@ if ! command -v pegasus-version >/dev/null 2>&1; then
     || sudo apt-get install -y pegasus \
     || echo "  ! Pegasus apt install failed; see PEGASUS-HTCONDOR.md for alternatives"
 fi
+
+# --- 4b. Apptainer (container runtime, ALL nodes) --------------------------
+# Containerized Pegasus transformations (e.g. earthquake-workflow's
+# docker://kthare10/earthquake-analysis image) run via singularity/apptainer on
+# the EXECUTE nodes. The install logic lives in install_apptainer.sh so it has a
+# single home, shared with `provision_pegasus_slice.py --install-apptainer`.
+# Export the knobs so the child script (a separate process) sees them; an unset
+# APPTAINER_DEB_URL is simply omitted (the child has its own default). Never let
+# the install abort the bootstrap.
+export INSTALL_APPTAINER APPTAINER_DEB_URL
+bash "${PEG_DIR}/install_apptainer.sh" || true
 
 if [ "${ROLE}" != "cm" ]; then
   log "execute node ready"
