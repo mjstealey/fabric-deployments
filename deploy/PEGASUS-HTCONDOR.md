@@ -317,19 +317,28 @@ validates, and starts the unit.
 condor_status
 pegasus-version
 
-# Vector can reach + authenticate to ES (submit node)
-curl --cacert /etc/vector/ca.crt -u vector_ingest:$ELASTIC_INGEST_PASSWORD \
-     https://workflow-monitor-es:9200/_cluster/health?pretty
+# Vector is reaching + authenticating to ES (submit node). Vector's own
+# healthcheck passing is the proof — `vector_ingest` is WRITE-ONLY, so a read
+# (e.g. _cluster/health) returns 403 and is NOT a useful liveness probe.
+systemctl is-active vector
+vector top                      # or: journalctl -u vector -f  → "Healthcheck passed"
 
 # After --run-example: the workflow runs and JSONL appears
 condor_q
 pegasus-status -l /opt/workflows/submit/diamond-run
 ls -l /opt/workflows/submit/diamond-run/workflow-events.jsonl
-vector top
 
-# Docs landing in ES (from the submit node, or on the ES node as elastic)
-curl --cacert /etc/vector/ca.crt -u vector_ingest:$ELASTIC_INGEST_PASSWORD \
-     'https://workflow-monitor-es:9200/workflow-events-*/_count?pretty'
+# Docs landing in ES — run on the ES node as the read-capable `elastic` user.
+# (vector_ingest can write but not search; and /etc/vector is root:vector 0750,
+#  so reading the CA on the submit node would need sudo. Querying the ES node
+#  over localhost sidesteps both.)
+pw=$(grep '^ELASTIC_PASSWORD=' ~/elastic-stack/.env | cut -d= -f2)
+curl -sk -u "elastic:$pw" 'https://localhost:9200/workflow-events-*/_count?pretty'
+
+# Optional — prove the submit→ES network path itself (sudo reads the CA; a 200
+# from _cluster/health confirms route + TLS + auth end to end):
+sudo curl --cacert /etc/vector/ca.crt -u elastic:<ELASTIC_PASSWORD> \
+     https://workflow-monitor-es:9200/_cluster/health?pretty
 ```
 
 If nothing connects, the cause is almost always one of: hitting a **management

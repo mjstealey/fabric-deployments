@@ -481,13 +481,15 @@ def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condo
     return sub_dir
 
 
-def _watch_hint(sub_dir, es_host):
+def _watch_hint(sub_dir):
     return (
         "  submitted. Watch progress on the submit node:\n"
         f"    condor_q ; pegasus-status -l {sub_dir}\n"
-        "  and confirm docs land in ES:\n"
-        "    curl --cacert /etc/vector/ca.crt -u vector_ingest:$ELASTIC_INGEST_PASSWORD \\\n"
-        f"      https://{es_host}:9200/workflow-events-*/_count?pretty"
+        "  confirm docs landed in ES — run on the ES node as the read-capable\n"
+        "  'elastic' user (vector_ingest is write-only, so _count returns 403):\n"
+        "    pw=$(grep '^ELASTIC_PASSWORD=' ~/elastic-stack/.env | cut -d= -f2)\n"
+        '    curl -sk -u "elastic:$pw" '
+        "https://localhost:9200/workflow-events-*/_count?pretty"
     )
 
 
@@ -503,7 +505,7 @@ def run_example(slice_obj, args):
     sub_dir = _plan_and_monitor(
         submit, runs, "diamond-run", runs, "diamond-workflow.yml"
     )
-    print(_watch_hint(sub_dir, args.es_host))
+    print(_watch_hint(sub_dir))
 
 
 def run_workflow(slice_obj, args):
@@ -553,7 +555,7 @@ def run_workflow(slice_obj, args):
     sub_dir = _plan_and_monitor(
         submit, runs, run_name, workdir, args.workflow_file, args.data_configuration
     )
-    print(_watch_hint(sub_dir, args.es_host))
+    print(_watch_hint(sub_dir))
 
 
 # ---------------------------------------------------------------------------

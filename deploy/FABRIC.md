@@ -296,8 +296,10 @@ byte-offset checkpoints — no loss.
 ## Verify end-to-end
 
 ```bash
-# From the submit node: TLS + auth + reachability in one shot.
-curl --cacert /etc/vector/ca.crt -u vector_ingest:$ELASTIC_INGEST_PASSWORD \
+# From the submit node: TLS + auth + reachability in one shot. Use `elastic`
+# (vector_ingest is write-only, so a read returns 403) and sudo (the CA lives
+# under /etc/vector, which is root:vector 0750). A 200 confirms route+TLS+auth.
+sudo curl --cacert /etc/vector/ca.crt -u elastic:$ELASTIC_PASSWORD \
      https://workflow-monitor-es:9200/_cluster/health?pretty
 
 vector validate /etc/vector/vector.toml
