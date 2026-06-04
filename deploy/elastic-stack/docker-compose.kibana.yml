@@ -1,0 +1,33 @@
+# Kibana overlay for the workflow-monitor Elasticsearch slice.
+#
+# Brought up by bootstrap_es_node.sh AFTER Elasticsearch is healthy and a
+# kibana_system service-account token has been minted into .env. Compose it
+# together with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.kibana.yml up -d kibana
+#
+# Secrets come from .env (written by the bootstrap), NOT this file:
+#   KIBANA_SERVICE_TOKEN   service-account token for elastic/kibana
+#   KIBANA_ENCRYPTION_KEY  saved-objects encryption key (32+ chars)
+#
+# Access is TUNNEL-ONLY — Kibana serves plain HTTP on :5601, reached from a
+# laptop via `ssh -L 5601:localhost:5601 … ubuntu@<es-node>`. Never expose it
+# publicly. ELASTICSEARCH_HOSTS uses the ES container_name (also a cert SAN), so
+# TLS validates against the CA the bootstrap generated.
+services:
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: workflow-monitor-kibana
+    restart: unless-stopped
+    depends_on:
+      - elasticsearch
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=5601
+      - ELASTICSEARCH_HOSTS=https://workflow-monitor-es:9200
+      - ELASTICSEARCH_SERVICEACCOUNTTOKEN=${KIBANA_SERVICE_TOKEN}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=/usr/share/kibana/config/certs/ca/ca.crt
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+    volumes:
+      - ./certs:/usr/share/kibana/config/certs:ro
+    ports:
+      - "5601:5601"

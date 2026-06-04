@@ -1,0 +1,43 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: workflow-monitor-es
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.enrollment.enabled=true
+      # HTTP TLS — Vector and clients hit this.
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/node/node.key
+      - xpack.security.http.ssl.certificate=certs/node/node.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      # Transport TLS — required when security is on, even single-node.
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.key=certs/node/node.key
+      - xpack.security.transport.ssl.certificate=certs/node/node.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-changeme-elastic}
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      # Host 9210 → container 9200 (host 9200 collides with RAATServe/Roon).
+      - "9210:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+      # CA + node cert generated once via elasticsearch-certutil; see README.
+      - ./certs:/usr/share/elasticsearch/config/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk -u elastic:${ELASTIC_PASSWORD:-changeme-elastic} https://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+  # Kibana lives in the docker-compose.kibana.yml overlay. bootstrap_es_node.sh
+  # mints a kibana_system service-account token into .env once ES is healthy,
+  # then brings it up alongside this file:
+  #   docker compose -f docker-compose.yml -f docker-compose.kibana.yml up -d kibana
+  # Access is tunnel-only (ssh -L 5601:localhost:5601 …); never expose :5601.
+
+volumes:
+  esdata: {}

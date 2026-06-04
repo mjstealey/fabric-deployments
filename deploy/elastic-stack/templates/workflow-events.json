@@ -1,0 +1,44 @@
+{
+  "index_patterns": ["workflow-events-*"],
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "workflow-retention",
+      "index.lifecycle.rollover_alias": "workflow-events-default"
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "strings_as_keyword": {
+            "match_mapping_type": "string",
+            "mapping": { "type": "keyword", "ignore_above": 1024 }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp":      { "type": "date" },
+        "timestamp":       { "type": "double" },
+        "event_type":      { "type": "keyword" },
+        "wf_uuid":         { "type": "keyword" },
+        "dax_label":       { "type": "keyword" },
+        "user":            { "type": "keyword" },
+        "submit_host":     { "type": "keyword" },
+        "submit_dir":      { "type": "keyword" },
+        "stream":          { "type": "keyword" },
+        "planner_version": { "type": "keyword" },
+        "wf_start":        { "type": "long" },
+        "wf_end":          { "type": "long" },
+        "state":           { "type": "keyword" },
+        "status":          { "type": "keyword" },
+        "exec_job_id":     { "type": "keyword" },
+        "job_id":          { "type": "long" },
+        "type_desc":       { "type": "keyword" },
+        "exitcode":        { "type": "integer" },
+        "site":            { "type": "keyword" },
+        "maxrss":          { "type": "long" },
+        "jobs":            { "type": "object", "enabled": true },
+        "stats":           { "type": "object", "enabled": true },
+        "pool":            { "type": "object", "enabled": true }
+      }
+    }
+  }
+}

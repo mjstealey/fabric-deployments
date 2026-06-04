@@ -1,0 +1,47 @@
+# FABRIC runtime configuration — TEMPLATE
+#
+# Copy to config/fabric_rc and fill in. Do NOT `source` this file — the {{ }}
+# Jinja and comma lists break shell word-splitting; it is parsed only by FABlib.
+# Validate with: uv run python preflight.py (expect all-PASS).
+#
+# FABRIC control-plane hosts below are public/standard for every FABRIC user —
+# leave them as-is. Replace every /path/to/... and <...> placeholder.
+
+# --- FABRIC control-plane hosts (public; do not change) ---
+export FABRIC_ORCHESTRATOR_HOST=orchestrator.fabric-testbed.net
+export FABRIC_CREDMGR_HOST=cm.fabric-testbed.net
+export FABRIC_CORE_API_HOST=uis.fabric-testbed.net
+export FABRIC_AM_HOST=artifacts.fabric-testbed.net
+export FABRIC_CEPH_MGR_HOST=https://ceph-mgr.fabric-testbed.net
+export FABRIC_BASTION_HOST=bastion.fabric-testbed.net
+
+# --- Identity / project (fill in) ---
+# Absolute path to your token JSON (see config/.tokens.json.template).
+export FABRIC_TOKEN_LOCATION=/path/to/fabric-deployments/config/.tokens.json
+# Your FABRIC project UUID (portal → your project page).
+export FABRIC_PROJECT_ID=<your-fabric-project-uuid>
+# Your bastion username (portal → User Profile).
+export FABRIC_BASTION_USERNAME=<your-bastion-username>
+
+# --- SSH keys (fill in absolute paths) ---
+export FABRIC_BASTION_KEY_LOCATION=/path/to/your/ssh/fabric-bastion
+export FABRIC_SLICE_PUBLIC_KEY_FILE=/path/to/your/ssh/fabric-sliver.pub
+export FABRIC_SLICE_PRIVATE_KEY_FILE=/path/to/your/ssh/fabric-sliver
+export FABRIC_BASTION_SSH_CONFIG_FILE=/path/to/your/ssh/fabric-ssh-config
+
+# --- Sites to avoid ---
+# Plain comma list — NO brackets/quotes. FABlib does a literal .split(","),
+# so any brackets/quotes become part of the site names and silently fail.
+export FABRIC_AVOID='EDUKY,EDC,GATECH,GPN'
+
+# --- SSH command line (keep {{ }} Jinja placeholders verbatim) ---
+# Only swap the -F path below to point at your fabric-ssh-config.
+export FABRIC_SSH_COMMAND_LINE=ssh -i {{ _self_.private_ssh_key_file }} -F /path/to/your/ssh/fabric-ssh-config {{ _self_.username }}@{{ _self_.management_ip }}
+
+# --- Logging ---
+export FABRIC_LOG_LEVEL=INFO
+export FABRIC_LOG_FILE=/tmp/fablib/fablib.log
+export FABRIC_LOG_PROPAGATE=False
+
+# --- Misc ---
+export FABRIC_METADATA_TAG=main

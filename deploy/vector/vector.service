@@ -1,0 +1,53 @@
+[Unit]
+Description=Vector log shipper for workflow-monitor
+Documentation=https://vector.dev/docs/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vector
+Group=vector
+
+# Vector binary and its config. Override paths via drop-in if your distro
+# installs vector somewhere else.
+ExecStart=/usr/bin/vector --config /etc/vector/vector.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Reads ELASTIC_INGEST_PASSWORD (and any other secrets vector.toml references
+# via ${VAR}). File must be mode 0600 owned by user vector.
+EnvironmentFile=/etc/vector/.env
+
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Resource limits — adjust for your workload.
+LimitNOFILE=65535
+
+# Hardening — restrict the process even if Vector is compromised.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+# Vector needs to write checkpoints + read the workflow JSONL paths.
+# Adjust ReadOnlyPaths / ReadWritePaths to your environment.
+ReadWritePaths=/var/lib/vector
+ReadOnlyPaths=/var/log /home /opt
+# CA bundle for ES TLS:
+ReadOnlyPaths=/etc/vector
+
+[Install]
+WantedBy=multi-user.target

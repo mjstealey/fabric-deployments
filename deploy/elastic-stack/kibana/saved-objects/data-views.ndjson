@@ -1,0 +1,3 @@
+{"id":"wf-events","type":"index-pattern","attributes":{"title":"workflow-events-*","name":"Workflow events","timeFieldName":"@timestamp"},"references":[],"coreMigrationVersion":"8.15.0","typeMigrationVersion":"8.0.0"}
+{"id":"wf-diag","type":"index-pattern","attributes":{"title":"workflow-diag-*","name":"Workflow diagnostics","timeFieldName":"@timestamp"},"references":[],"coreMigrationVersion":"8.15.0","typeMigrationVersion":"8.0.0"}
+{"id":"wf-jobstate-current","type":"index-pattern","attributes":{"title":"workflow-jobstate-current","name":"Workflow job state (current)"},"references":[],"coreMigrationVersion":"8.15.0","typeMigrationVersion":"8.0.0"}

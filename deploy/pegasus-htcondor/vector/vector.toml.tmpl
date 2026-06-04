@@ -1,0 +1,105 @@
+# Vector config for the pegasus-htcondor submit node (node template).
+# Rendered by bootstrap_pegasus_node.sh: __RUNS_DIR__ / __ES_HOST__ / __CA_FILE__
+# are substituted before this lands at /etc/vector/vector.toml.
+#
+# Same shape as deploy/vector/vector.toml (the laptop prototype); only the paths
+# and the ES sink endpoint differ — it ships to the Elasticsearch slice over
+# private FABNetv4 instead of localhost.
+
+# Node-local checkpoint + disk-buffer state (ReadWritePaths in vector.service).
+data_dir = "/var/lib/vector"
+
+[api]
+enabled = true
+address = "127.0.0.1:8686"
+
+# ── Sources ──────────────────────────────────────────────────────────────
+# workflow-monitor --serve --diagnose --log writes these two JSONL streams into
+# each workflow's submit dir under the runs root.
+[sources.workflow_events]
+type      = "file"
+# Match the JSONL anywhere under the runs root. (Do NOT assume a run* dir name:
+# pegasus-plan --relative-submit-dir sets arbitrary names, e.g. "diamond-run".)
+include   = ["__RUNS_DIR__/**/workflow-events.jsonl"]
+read_from = "beginning"
+fingerprint.strategy = "device_and_inode"
+
+[sources.workflow_diag]
+type      = "file"
+include   = ["__RUNS_DIR__/**/diagnostics-events.jsonl"]
+read_from = "beginning"
+fingerprint.strategy = "device_and_inode"
+
+# ── Transforms ───────────────────────────────────────────────────────────
+[transforms.parse_events]
+type   = "remap"
+inputs = ["workflow_events"]
+source = '''
+parsed, err = parse_json(.message)
+if err != null {
+  log("dropping unparseable workflow-events line: " + err, level: "error")
+  abort
+}
+. = parsed
+if exists(.timestamp) {
+  ts_ms = to_int(to_float!(.timestamp) * 1000)
+  .@timestamp = from_unix_timestamp!(ts_ms, unit: "milliseconds")
+}
+.submit_host = get_hostname!()
+.stream      = "workflow_events"
+'''
+
+[transforms.parse_diag]
+type   = "remap"
+inputs = ["workflow_diag"]
+source = '''
+parsed, err = parse_json(.message)
+if err != null {
+  log("dropping unparseable diagnostics-events line: " + err, level: "error")
+  abort
+}
+. = parsed
+if exists(.timestamp) {
+  ts_ms = to_int(to_float!(.timestamp) * 1000)
+  .@timestamp = from_unix_timestamp!(ts_ms, unit: "milliseconds")
+}
+.submit_host = get_hostname!()
+.stream      = "workflow_diag"
+'''
+
+# ── Sinks ────────────────────────────────────────────────────────────────
+# HTTPS + basic auth as the scoped vector_ingest user. tls.ca_file pins the CA
+# pulled back from the ES slice (uploaded by provision_pegasus_slice.py --wire-es).
+[sinks.es_events]
+type          = "elasticsearch"
+inputs        = ["parse_events"]
+endpoints     = ["https://__ES_HOST__:9200"]
+mode          = "bulk"
+api_version   = "v8"
+bulk.index    = "workflow-events-default"
+auth.strategy = "basic"
+auth.user     = "vector_ingest"
+auth.password = "${ELASTIC_INGEST_PASSWORD}"
+tls.ca_file   = "__CA_FILE__"
+
+[sinks.es_events.buffer]
+type      = "disk"
+max_size  = 536870912
+when_full = "block"
+
+[sinks.es_diag]
+type          = "elasticsearch"
+inputs        = ["parse_diag"]
+endpoints     = ["https://__ES_HOST__:9200"]
+mode          = "bulk"
+api_version   = "v8"
+bulk.index    = "workflow-diag-default"
+auth.strategy = "basic"
+auth.user     = "vector_ingest"
+auth.password = "${ELASTIC_INGEST_PASSWORD}"
+tls.ca_file   = "__CA_FILE__"
+
+[sinks.es_diag.buffer]
+type      = "disk"
+max_size  = 536870912
+when_full = "block"

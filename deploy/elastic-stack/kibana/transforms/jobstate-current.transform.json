@@ -1,0 +1,34 @@
+{
+  "description": "Latest state per (wf_uuid, exec_job_id) from job_state events. Powers the accurate 'current job state' donut/table in Kibana — an event-on-change stream cannot answer 'how many jobs are in each state right now' without collapsing transitions to the latest one per job.",
+  "source": {
+    "index": ["workflow-events-*"],
+    "query": { "term": { "event_type": "job_state" } }
+  },
+  "dest": { "index": "workflow-jobstate-current" },
+  "pivot": {
+    "group_by": {
+      "wf_uuid":     { "terms": { "field": "wf_uuid" } },
+      "exec_job_id": { "terms": { "field": "exec_job_id" } }
+    },
+    "aggregations": {
+      "last_seen": { "max": { "field": "@timestamp" } },
+      "current": {
+        "top_metrics": {
+          "metrics": [
+            { "field": "state" },
+            { "field": "type_desc" },
+            { "field": "exitcode" }
+          ],
+          "sort": { "@timestamp": "desc" }
+        }
+      }
+    }
+  },
+  "sync": {
+    "time": { "field": "@timestamp", "delay": "60s" }
+  },
+  "frequency": "10s",
+  "settings": {
+    "max_page_search_size": 500
+  }
+}

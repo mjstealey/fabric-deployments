@@ -1,0 +1,119 @@
+# Vector config for workflow-monitor — TEMPLATE (safe to commit).
+#
+# This is the LAPTOP / prototype Vector config. Copy it to
+# deploy/vector/vector.toml (gitignored) and replace every /path/to/...
+# placeholder below with absolute paths for your checkout:
+#     cp deploy/vector/vector.toml.template deploy/vector/vector.toml
+#     $EDITOR deploy/vector/vector.toml
+#
+# NOTE: the in-VM submit node does NOT use this file. It renders
+# deploy/pegasus-htcondor/vector/vector.toml.tmpl instead (already a template),
+# which is wired for the FABRIC ES slice. Edit this one only for local/prototype
+# shipping from a developer laptop.
+#
+# Tails Pegasus workflow JSONL logs and ships into Elasticsearch.
+
+# Checkpoints live here so Vector can resume cleanly across restarts.
+data_dir = "/path/to/fabric-deployments/deploy/vector/data"
+
+# Local API for `vector top` / `vector tap` introspection.
+[api]
+enabled = true
+address = "127.0.0.1:8686"
+
+# ── Sources ──────────────────────────────────────────────────────────────
+[sources.workflow_events]
+type      = "file"
+# Wider Pegasus layout — <root>/<user>/pegasus/<dax_label>/run000N/.
+include   = [
+  "/path/to/example-workflows/**/submit/**/run*/workflow-events.jsonl",
+]
+read_from         = "beginning"
+# Omit ignore_older_secs for the prototype — earthquake-workflow runs are months old.
+# In production set this (e.g. 30 days) to bound discovery cost.
+fingerprint.strategy = "device_and_inode"
+
+[sources.workflow_diag]
+type      = "file"
+include   = [
+  "/path/to/example-workflows/**/submit/**/run*/diagnostics-events.jsonl",
+]
+read_from         = "beginning"
+fingerprint.strategy = "device_and_inode"
+
+# ── Transforms ───────────────────────────────────────────────────────────
+[transforms.parse_events]
+type   = "remap"
+inputs = ["workflow_events"]
+source = '''
+parsed, err = parse_json(.message)
+if err != null {
+  log("dropping unparseable workflow-events line: " + err, level: "error")
+  abort
+}
+. = parsed
+if exists(.timestamp) {
+  ts_ms = to_int(to_float!(.timestamp) * 1000)
+  .@timestamp = from_unix_timestamp!(ts_ms, unit: "milliseconds")
+}
+.submit_host = get_hostname!()
+.stream      = "workflow_events"
+'''
+
+[transforms.parse_diag]
+type   = "remap"
+inputs = ["workflow_diag"]
+source = '''
+parsed, err = parse_json(.message)
+if err != null {
+  log("dropping unparseable diagnostics-events line: " + err, level: "error")
+  abort
+}
+. = parsed
+if exists(.timestamp) {
+  ts_ms = to_int(to_float!(.timestamp) * 1000)
+  .@timestamp = from_unix_timestamp!(ts_ms, unit: "milliseconds")
+}
+.submit_host = get_hostname!()
+.stream      = "workflow_diag"
+'''
+
+# ── Sinks ────────────────────────────────────────────────────────────────
+# Phase 3: HTTPS + basic auth as scoped user vector_ingest. CA cert is
+# the one elasticsearch-certutil generated for the local cluster; for a
+# remote deploy point tls.ca_file at the production CA bundle.
+[sinks.es_events]
+type          = "elasticsearch"
+inputs        = ["parse_events"]
+endpoints     = ["https://localhost:9210"]
+mode          = "bulk"
+api_version   = "v8"
+bulk.index    = "workflow-events-default"
+auth.strategy = "basic"
+auth.user     = "vector_ingest"
+auth.password = "${ELASTIC_INGEST_PASSWORD}"
+tls.ca_file   = "/path/to/fabric-deployments/deploy/elastic-stack/certs/ca/ca.crt"
+
+# Phase 4: disk-backed buffer survives Vector crashes and ES outages.
+# 256 MiB cap with backpressure (block sources rather than drop events).
+[sinks.es_events.buffer]
+type      = "disk"
+max_size  = 536870912
+when_full = "block"
+
+[sinks.es_diag]
+type          = "elasticsearch"
+inputs        = ["parse_diag"]
+endpoints     = ["https://localhost:9210"]
+mode          = "bulk"
+api_version   = "v8"
+bulk.index    = "workflow-diag-default"
+auth.strategy = "basic"
+auth.user     = "vector_ingest"
+auth.password = "${ELASTIC_INGEST_PASSWORD}"
+tls.ca_file   = "/path/to/fabric-deployments/deploy/elastic-stack/certs/ca/ca.crt"
+
+[sinks.es_diag.buffer]
+type      = "disk"
+max_size  = 536870912
+when_full = "block"

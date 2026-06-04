@@ -1,0 +1,18 @@
+[project]
+name = "fabric-deployments"
+version = "0.1.0"
+description = "uv-managed FABlib runtime, slice recipes, and deploy assets for FABRIC deployments (workflow-monitor Elasticsearch, etc.)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # FABlib: the FABRIC client library. provision_es_slice.py imports
+    # `fabrictestbed_extensions.fablib`. Pulls in paramiko, requests, etc.
+    "fabrictestbed-extensions>=2.0.6",
+]
+
+# This project is an environment + script runner, not an installable package.
+# uv builds a venv with the dependencies above; the recipes are run as plain
+# scripts (`uv run python recipes/...`), so there is nothing to build/install.
+[tool.uv]
+package = false

@@ -1,0 +1,8 @@
+{
+  "_comment": "TEMPLATE — do not use as-is. Obtain a real token from the FABRIC portal: Experiments > Manage Tokens > Create Token. Save the downloaded JSON to config/.tokens.json (gitignored), then refresh locally with: uv run python refresh_token.py. Lifetimes: identity (id_token) ~4h; refresh_token ~24h and is rotated on each use. FABRIC_TOKEN_LOCATION in config/fabric_rc must point at the real file.",
+  "id_token": "<paste-from-FABRIC-portal>",
+  "refresh_token": "<paste-from-FABRIC-portal>",
+  "created_at": "<YYYY-MM-DD HH:MM:SS +0000>",
+  "expires_at": "<YYYY-MM-DD HH:MM:SS +0000>",
+  "state": "<token-state>"
+}

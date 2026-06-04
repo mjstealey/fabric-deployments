@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd unit for Vector (workflow-monitor shipping) — TEMPLATE.
+
+  Copy to com.vectordotdev.vector.plist and edit the /path/to/... paths below
+  to point at your checkout BEFORE you `launchctl load` it:
+    cp deploy/vector/com.vectordotdev.vector.plist.template \
+       deploy/vector/com.vectordotdev.vector.plist
+    $EDITOR deploy/vector/com.vectordotdev.vector.plist
+
+  Per-user install:
+    cp deploy/vector/com.vectordotdev.vector.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vectordotdev.vector.plist
+    launchctl kickstart -p gui/$(id -u)/com.vectordotdev.vector
+
+  System-wide install:
+    sudo cp ... /Library/LaunchDaemons/  ; sudo launchctl bootstrap system ...
+
+  ELASTIC_INGEST_PASSWORD must be set in the environment that loads this
+  plist. Easiest options:
+    - Put the assignment in deploy/vector/load.sh and invoke launchctl from there.
+    - Use EnvironmentVariables here (visible in `launchctl print` — avoid for real secrets).
+    - Use macOS Keychain + a wrapper script that exports it before exec'ing vector.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.vectordotdev.vector</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/vector</string>
+    <string>--config</string>
+    <string>/path/to/fabric-deployments/deploy/vector/vector.toml</string>
+  </array>
+
+  <!-- Keep it running. Don't restart in tight loops if vector keeps dying. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Working directory and env. Set ELASTIC_INGEST_PASSWORD before loading
+       (e.g. launchctl setenv ELASTIC_INGEST_PASSWORD …) or rewrite this
+       plist to point ProgramArguments at a wrapper that sources .env. -->
+  <key>WorkingDirectory</key>
+  <string>/path/to/fabric-deployments</string>
+
+  <key>StandardOutPath</key>
+  <string>/path/to/Library/Logs/vector-workflow-monitor.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/Library/Logs/vector-workflow-monitor.err.log</string>
+
+  <!-- Match systemd's LimitNOFILE=65535. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>65535</integer>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,32 @@
+{
+  "index_patterns": ["workflow-diag-*"],
+  "template": {
+    "settings": {
+      "index.lifecycle.name": "workflow-retention",
+      "index.lifecycle.rollover_alias": "workflow-diag-default"
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "strings_as_keyword": {
+            "match_mapping_type": "string",
+            "mapping": { "type": "keyword", "ignore_above": 1024 }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp":      { "type": "date" },
+        "timestamp":       { "type": "double" },
+        "event_type":      { "type": "keyword" },
+        "wf_uuid":         { "type": "keyword" },
+        "submit_host":     { "type": "keyword" },
+        "stream":          { "type": "keyword" },
+        "schema_version":  { "type": "integer" },
+        "detector":        { "type": "keyword" },
+        "signal":          { "type": "keyword" },
+        "reason":          { "type": "text" },
+        "engine_config":   { "type": "object", "enabled": true }
+      }
+    }
+  }
+}

@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# fabric-deployments — .gitignore (public repo)
+# Never commit credentials, TLS private keys, the HTCondor pool password, the
+# host-specific FABRIC config, or per-deploy runtime state. Copy the committed
+# *.template files to their real names and fill them in locally (see README.md
+# and config/README.md).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── FABRIC credentials & tokens ──────────────────────────────────────────────
+config/.tokens.json
+.tokens.json
+*.tokens.json
+
+# Host-specific FABRIC runtime config (real project UUID, bastion username,
+# absolute key paths). Commit config/fabric_rc.template instead.
+config/fabric_rc
+
+# ── Environment files (ES/ingest passwords, Kibana token) ────────────────────
+.env
+.env.*
+**/.env
+
+# ── Host-specific rendered configs (commit the *.template versions) ──────────
+# The laptop/prototype Vector config + launchd unit carry absolute paths.
+deploy/vector/vector.toml
+deploy/vector/com.vectordotdev.vector.plist
+
+# ── Elastic Stack TLS material (CA/node certs + private keys; per-deploy) ─────
+deploy/elastic-stack/certs/
+
+# CA pulled back from a provisioned ES slice
+ca.crt
+**/ca.crt
+
+# ── Vector runtime state (checkpoints + disk buffers) ────────────────────────
+deploy/vector/data/
+
+# ── pegasus-htcondor pool secret / uploaded artifacts (per-deploy) ───────────
+deploy/pegasus-htcondor/.pool-password
+deploy/pegasus-htcondor/vendor/
+
+# ── Defensive: stray key / cert material anywhere ────────────────────────────
+*.key
+*.pem
+*.p12
+*.pfx
+
+# ── uv / Python ──────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.python-version.local
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# ── Editor / OS cruft ────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# …but ALWAYS commit the placeholder templates. These negations come last so
+# they win over every rule above (e.g. .env.* would otherwise hide .env.template).
+# ─────────────────────────────────────────────────────────────────────────────
+!*.template
+!**/*.template

@@ -1,0 +1,27 @@
+{
+  "index_patterns": ["workflow-jobstate-current"],
+  "priority": 200,
+  "template": {
+    "settings": {
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp":  { "type": "date" },
+        "last_seen":   { "type": "date" },
+        "wf_uuid":     { "type": "keyword" },
+        "exec_job_id": { "type": "keyword" },
+        "current": {
+          "properties": {
+            "state":     { "type": "keyword" },
+            "type_desc": { "type": "keyword" },
+            "exitcode":  { "type": "integer" }
+          }
+        }
+      }
+    }
+  },
+  "_meta": {
+    "description": "Mapping for the workflow-jobstate-current transform dest index. Single-node ES → 0 replicas to stay green."
+  }
+}
