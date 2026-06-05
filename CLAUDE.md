@@ -99,3 +99,11 @@ it (and expect all-PASS) before provisioning, and after any `config/fabric_rc` e
   same-project requirement for inter-slice routing, an existing peer slice with a
   FABNetv4 NIC, and lease renewal live in `recipes/elastic-stack/README.md` and
   `deploy/FABRIC.md`, and `preflight.py` cannot check them.
+- **Pipeline gaps are usually routing, not Kibana/ingest.** If recent workflow
+  events stop appearing in Elasticsearch/Kibana while older data is present, the
+  cause is almost always a lost inter-slice FABNetv4 route after a VM reboot —
+  Vector on the submit node times out reaching ES (events still land in the local
+  `workflow-events.jsonl`). Diagnose backwards (ES `_count` → `journalctl -u
+  vector` for timeouts → `ping` the ES FABNet IP → `ip route | grep 10.128.0.0/10`
+  on each node) and fix by `--reconfigure`-ing the slice missing the route. Full
+  runbook: **`deploy/FABRIC.md` → Troubleshooting**.

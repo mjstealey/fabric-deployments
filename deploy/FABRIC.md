@@ -372,6 +372,83 @@ If you skip persistent storage, ES data lives on the node's root disk
 
 ---
 
+## Troubleshooting
+
+### Recent events stop reaching Elasticsearch / Kibana (worked before, not now)
+
+**Symptom.** Kibana (or a direct ES query) shows data up to some point in the
+past but nothing recent, even though the workflow ran and wrote events locally
+(`workflow-events.jsonl` on the submit node keeps growing).
+
+**Most likely cause — an inter-slice route lost on a reboot.** FABNetv4
+data-plane IPs *and* the `10.128.0.0/10` inter-slice route do **not** survive a
+VM reboot on their own (the route is re-added by a systemd one-shot, but only if
+that unit was installed and the IP/gateway came back unchanged). If **either**
+slice rebooted and lost its route, Vector on the submit node can no longer reach
+ES: events are captured to the local JSONL and pile up in Vector's sink, which
+logs `Request timed out` and never delivers. workflow-monitor and the workflow
+itself are unaffected (they use only the local HTCondor pool), so it *looks*
+like a Kibana or ingest problem when it is really a one-line routing problem.
+
+**Diagnose — walk the pipeline backwards** (all read-only):
+
+```bash
+# 1. Is it actually in ES?  (on the ES node, as the read-capable `elastic` user
+#    — vector_ingest is write-only and returns 401/403 on reads)
+pw=$(grep '^ELASTIC_PASSWORD=' ~/elastic-stack/.env | cut -d= -f2)
+curl -sk -u "elastic:$pw" 'https://localhost:9200/workflow-events-*/_count'
+curl -sk -u "elastic:$pw" \
+  'https://localhost:9200/workflow-events-*/_search?size=1&sort=timestamp:desc&_source=event_type,timestamp&pretty'
+#    -> if the latest `timestamp` (a unix epoch float) is stale, today's docs
+#       never arrived. If they ARE there, the problem is a Kibana time range /
+#       data-view time field, not the pipeline — stop here.
+
+# 2. Is Vector erroring?  (on the submit node)
+sudo journalctl -u vector --no-pager -n 20 | grep -iE 'timed out|error'
+#    -> repeated "Request timed out" for the elasticsearch sinks == can't reach ES.
+
+# 3. Is the inter-slice path up?  (on the submit node)
+ping -c2 <ES-fabnet-IP>            # the IP in /etc/hosts for workflow-monitor-es
+#    -> 100% packet loss == data-plane/route broken.
+
+# 4. Which side lost the route?  (run on BOTH nodes)
+ip -4 -br addr show | grep -v lo  # each node should still have its 10.134.x FABNet IP
+ip route | grep '10.128.0.0/10'   # each node MUST have: 10.128.0.0/10 via <its-own-gw>
+#    -> the node MISSING the 10.128.0.0/10 route is the broken side. NOTE a node
+#       can still have its FABNet IP yet be missing the route — that alone breaks
+#       return traffic (requests arrive, replies are black-holed).
+```
+
+**Fix — `--reconfigure` the slice that lost the route.** It re-applies the
+data-plane IP(s) and re-installs + persists the `10.128.0.0/10` route via the
+fablib-discovered gateway (and, on the pegasus side, restarts condor):
+
+```bash
+# ES side:
+uv run python recipes/elastic-stack/provision.py    --name elasticsearch-host --reconfigure
+# Pegasus side:
+uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor   --reconfigure
+```
+
+Reconfiguring **both** is the safe default. Once the route is back, Vector
+flushes its queued requests automatically — **no Vector restart needed** (a
+restart can drop in-memory-buffered events). Confirm recovery: `ping` is 0%
+loss, `journalctl -u vector` stops logging timeouts, and the ES `_count` climbs
+with the latest-event timestamp now current. The route is persisted as the
+`fabnet-interslice-route.service` systemd one-shot, so it survives the *next*
+reboot.
+
+> **Worked example (2026-06-05).** Kibana showed data through ~Jun 4 20:00 UTC
+> but nothing from a Jun 5 run. The submit node had its IP + the `10.128.0.0/10`
+> route and reached its gateway; the ES node (`es1`) had its IP `10.134.132.2`
+> but **only** its own `/24` — no `10.128.0.0/10 via 10.134.132.1`. So submit→ES
+> packets arrived but replies were black-holed (`ping` 100% loss; Vector
+> `Request timed out`). `--reconfigure` on `elasticsearch-host` re-added the
+> route; Vector immediately drained the day's queued events into ES (count
+> 838 → 1175).
+
+---
+
 ## Alternatives
 
 | Goal | Approach | Trade-off |
