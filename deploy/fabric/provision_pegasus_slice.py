@@ -437,7 +437,9 @@ def _workflow_basename(src):
     return name or "workflow"
 
 
-def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condorio"):
+def _plan_and_monitor(
+    submit, runs, run_name, workdir, wf_file, data_conf="condorio", live_events=False
+):
     """Plan+submit wf_file from workdir into runs/submit/<run_name>, then monitor.
 
     Shared tail of --run-example and --run-workflow. Ensures a no-shared-fs data
@@ -445,6 +447,12 @@ def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condo
     default 'sharedfs' would fail), plans with a deterministic submit dir under
     the runs root, and launches a headless workflow-monitor whose JSONL Vector is
     already tailing. Returns the submit dir.
+
+    When live_events is set, monitord additionally emits its native
+    workflow-monitor event stream (pegasus.monitord.wfmonitor.url=true ->
+    <submit_dir>/monitord-events.jsonl) and workflow-monitor consumes it with
+    --source live, getting events as monitord parses them instead of polling the
+    stampede DB. The merged workflow-events.jsonl Vector ships is unchanged.
     """
     sub_dir = f"{runs}/submit/{run_name}"
     # Force the pool's data config unless the workflow already chose one. Workers
@@ -455,6 +463,13 @@ def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condo
         "grep -q '^pegasus.data.configuration' pegasus.properties || "
         f"printf 'pegasus.data.configuration=%s\\n' {data_conf} >> pegasus.properties"
     )
+    if live_events:
+        # Add monitord's live workflow-monitor sink alongside the stampede DB.
+        submit.execute(
+            f"cd {workdir} && "
+            "grep -q '^pegasus.monitord.wfmonitor.url' pegasus.properties || "
+            "printf 'pegasus.monitord.wfmonitor.url = true\\n' >> pegasus.properties"
+        )
     out, _ = submit.execute(
         f"cd {workdir} && rm -rf {sub_dir} && "
         "pegasus-plan --conf pegasus.properties "
@@ -474,6 +489,7 @@ def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condo
         # for it (up to ~60s) before launching the monitor.
         f"for i in $(seq 1 30); do ls {sub_dir}/*.stampede.db >/dev/null 2>&1 && break; sleep 2; done; "
         f"nohup workflow-monitor {sub_dir} --serve --diagnose --log "
+        f"{'--source live ' if live_events else ''}"
         f">{runs}/monitor-{run_name}.out 2>&1 & sleep 8; "
         f"ls -l {sub_dir}/workflow-events.jsonl 2>/dev/null || "
         "echo 'no JSONL yet — check pegasus-monitord / workflow-monitor output'"
@@ -503,7 +519,12 @@ def run_example(slice_obj, args):
         f"cd {runs} && python3 ~/{REMOTE_DIR}/examples/diamond.py 2>&1 | tail -30"
     )
     sub_dir = _plan_and_monitor(
-        submit, runs, "diamond-run", runs, "diamond-workflow.yml"
+        submit,
+        runs,
+        "diamond-run",
+        runs,
+        "diamond-workflow.yml",
+        live_events=args.live_events,
     )
     print(_watch_hint(sub_dir))
 
@@ -553,7 +574,13 @@ def run_workflow(slice_obj, args):
         f"==> planning {args.workflow_file} from {workdir} (data_conf={args.data_configuration})"
     )
     sub_dir = _plan_and_monitor(
-        submit, runs, run_name, workdir, args.workflow_file, args.data_configuration
+        submit,
+        runs,
+        run_name,
+        workdir,
+        args.workflow_file,
+        args.data_configuration,
+        live_events=args.live_events,
     )
     print(_watch_hint(sub_dir))
 
@@ -686,6 +713,16 @@ def parse_args(argv=None):
 
     p.add_argument(
         "--run-example", action="store_true", help="plan+submit the diamond smoke test"
+    )
+    p.add_argument(
+        "--live-events",
+        action="store_true",
+        help="consume workflow events live from pegasus-monitord's "
+        "WorkflowMonitorEventSink (sets pegasus.monitord.wfmonitor.url=true and runs "
+        "workflow-monitor with --source live) instead of polling the stampede DB. "
+        "Requires the live-events build of Pegasus + workflow-monitor on the submit "
+        "node; the merged workflow-events.jsonl (and the Vector->ES pipeline) is "
+        "unchanged.",
     )
 
     # Generic workflow runner (post-hoc; the pool must already be bootstrapped).
