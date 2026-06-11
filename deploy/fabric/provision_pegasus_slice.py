@@ -700,7 +700,15 @@ def _workflow_basename(src):
 
 
 def _plan_and_monitor(
-    submit, runs, run_name, workdir, wf_file, data_conf="condorio", enable_plugin=False
+    submit,
+    runs,
+    run_name,
+    workdir,
+    wf_file,
+    data_conf="condorio",
+    enable_plugin=False,
+    tick_interval=5.0,
+    condor_poll=True,
 ):
     """Plan+submit wf_file from workdir into runs/submit/<run_name>, then monitor.
 
@@ -714,7 +722,10 @@ def _plan_and_monitor(
     monitord plugin (deploy/MONITORD-PLUGIN.md), so pegasus-monitord itself
     writes monitord-events.jsonl into the submit dir live -- the third stream
     Vector tails -- while the polling-path workflow-monitor keeps running
-    unchanged for side-by-side comparison.
+    unchanged for side-by-side comparison. With condor_poll (the default), the
+    plugin also polls condor_q/history/status from monitord's tick() at
+    tick_interval seconds; --no-monitord-condor-poll is the regression
+    configuration (plugin on, polling off, pre-tick behavior).
     """
     sub_dir = f"{runs}/submit/{run_name}"
     # Force the pool's data config unless the workflow already chose one. Workers
@@ -730,12 +741,20 @@ def _plan_and_monitor(
         # the workdir across runs: drop any stale plugin block, then append the
         # current one. (Properties must be in place before pegasus-plan bakes
         # them into the submit dir's run properties for monitord.)
+        plugin_props = [
+            "pegasus.monitord.plugins.wfmonitor.enabled=true",
+            f"pegasus.monitord.plugins.wfmonitor.events_path={sub_dir}/monitord-events.jsonl",
+        ]
+        if condor_poll:
+            plugin_props += [
+                f"pegasus.monitord.plugins.wfmonitor.tick_interval={tick_interval:g}",
+                "pegasus.monitord.plugins.wfmonitor.condor_poll=true",
+            ]
+        block = "\\n".join(plugin_props) + "\\n"
         submit.execute(
             f"cd {workdir} && "
             "sed -i '/^pegasus\\.monitord\\.plugins\\./d' pegasus.properties && "
-            "printf 'pegasus.monitord.plugins.wfmonitor.enabled=true\\n"
-            "pegasus.monitord.plugins.wfmonitor.events_path=%s\\n' "
-            f"'{sub_dir}/monitord-events.jsonl' >> pegasus.properties"
+            f"printf '{block}' >> pegasus.properties"
         )
     out, _ = submit.execute(
         f"cd {workdir} && rm -rf {sub_dir} && "
@@ -794,6 +813,8 @@ def run_example(slice_obj, args):
         runs,
         "diamond-workflow.yml",
         enable_plugin=args.enable_monitord_plugin,
+        tick_interval=args.monitord_tick_interval,
+        condor_poll=args.monitord_condor_poll,
     )
     print(_watch_hint(sub_dir))
 
@@ -850,6 +871,8 @@ def run_workflow(slice_obj, args):
         args.workflow_file,
         args.data_configuration,
         enable_plugin=args.enable_monitord_plugin,
+        tick_interval=args.monitord_tick_interval,
+        condor_poll=args.monitord_condor_poll,
     )
     print(_watch_hint(sub_dir))
 
@@ -1065,6 +1088,23 @@ def parse_args(argv=None):
         "pegasus.monitord.plugins.wfmonitor.* properties into the run so "
         "pegasus-monitord streams monitord-events.jsonl live "
         "(needs --install-monitord-plugin done once)",
+    )
+    p.add_argument(
+        "--monitord-tick-interval",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="with --enable-monitord-plugin: the plugin host's tick cadence "
+        "(drives the in-plugin condor polling; history/pool sub-throttle off it)",
+    )
+    p.add_argument(
+        "--monitord-condor-poll",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --enable-monitord-plugin: also poll condor_q/history/status "
+        "from inside pegasus-monitord via the plugin's tick(). "
+        "--no-monitord-condor-poll is the regression configuration "
+        "(plugin on, condor polling off)",
     )
     p.add_argument(
         "--reconfigure",
