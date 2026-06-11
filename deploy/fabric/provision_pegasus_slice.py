@@ -26,6 +26,10 @@ What it does
              workflow-monitor + Vector (Vector stays stopped until --wire-es)
   apptainer  (--install-apptainer) retrofit just the container runtime onto an
              existing slice (idempotent, no condor restart -- safe on a live pool)
+  plugin     (--install-monitord-plugin) retrofit the pegasus-monitord plugin
+             system + the wfmonitor adapter onto the submit node and add the
+             monitord-events stream to Vector (deploy/MONITORD-PLUGIN.md);
+             per-run opt-in via --enable-monitord-plugin on the run actions
   wire-es    (--wire-es) upload the ES slice's CA, finalize the Vector sink, and
              start Vector on the submit node
   example    (--run-example) plan+submit a tiny diamond workflow under
@@ -63,7 +67,9 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # The whole FABNetv4 address space. A route to this /10 via the node's own
@@ -89,6 +95,7 @@ CONDOR_DIR = PEG_DIR / "condor"
 VECTOR_TMPL = PEG_DIR / "vector" / "vector.toml.tmpl"
 VECTOR_SERVICE = REPO_ROOT / "deploy" / "vector" / "vector.service"
 EXAMPLE_WF = PEG_DIR / "examples" / "diamond.py"
+OVERLAY_SH = PEG_DIR / "overlay_monitord_plugin.sh"
 POOL_PW_FILE = PEG_DIR / ".pool-password"
 # Same path the ES provisioner downloads its CA to (this file is in deploy/fabric/).
 CA_DEFAULT = Path(__file__).resolve().parent / "ca.crt"
@@ -101,6 +108,27 @@ CONDOR_FILES = [
     "10-central-manager.conf",
     "20-execute.conf",
 ]
+
+# --- monitord plugin stack (deploy/MONITORD-PLUGIN.md) ----------------------
+# The pegasus-monitord entry-point plugin system is pure Python: these three
+# files overlaid onto the apt-installed tree ARE the install. Pinned to the
+# tip of pegasus-isi/pegasus branch monitord-plugin-system (includes the
+# cross-thread payload race fix).
+MONITORD_PLUGIN_REF = "c3d6be8735f89a3d25d0419695bcc91b44333a24"
+MONITORD_PLUGIN_FILES = [  # repo-relative under packages/pegasus-python/src/Pegasus/
+    "monitoring/plugin.py",
+    "monitoring/event_output.py",
+    "cli/pegasus-monitord.py",
+]
+# The workflow-monitor build that registers the wfmonitor plugin in the
+# pegasus.monitord.plugins entry-point group. Separate from
+# --workflow-monitor-spec so the fresh-bootstrap default stays on main.
+MONITORD_ADAPTER_SPEC = (
+    "git+https://github.com/pegasus-isi/workflow-monitor.git@monitord-plugin-adapter"
+)
+MONITORD_MANIFEST = (
+    "/usr/lib/pegasus/python/Pegasus/monitoring/.monitord-plugin-manifest.json"
+)
 
 
 def _load_fablib():
@@ -380,6 +408,240 @@ def install_apptainer(slice_obj, args):
 
 
 # ---------------------------------------------------------------------------
+# Monitord plugin stack (retrofit; see deploy/MONITORD-PLUGIN.md)
+# ---------------------------------------------------------------------------
+
+
+def _git_desc(path):
+    """`git describe --always --dirty` for provenance, or 'unknown'."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(path), "describe", "--always", "--dirty"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _upload_adapter_tree(submit, src):
+    """Tar a local workflow-monitor tree (sans VCS/venv cruft), upload, extract.
+
+    The fast iteration loop for adapter development: the node installs exactly
+    the local working tree, no push to GitHub needed. Returns the remote dir
+    to hand to pip.
+    """
+    fd, tarball = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [
+                "tar",
+                "czf",
+                tarball,
+                "--exclude=.git",
+                "--exclude=.venv",
+                "--exclude=__pycache__",
+                "--exclude=dist",
+                "--exclude=*.egg-info",
+                "-C",
+                str(src.parent),
+                src.name,
+            ],
+            check=True,
+        )
+        submit.upload_file(tarball, f"{REMOTE_DIR}/workflow-monitor-src.tar.gz")
+    finally:
+        os.unlink(tarball)
+    submit.execute(
+        f"rm -rf ~/{REMOTE_DIR}/workflow-monitor-src && "
+        f"mkdir -p ~/{REMOTE_DIR}/workflow-monitor-src && "
+        f"tar xzf ~/{REMOTE_DIR}/workflow-monitor-src.tar.gz "
+        f"-C ~/{REMOTE_DIR}/workflow-monitor-src --strip-components=1"
+    )
+    return f"$HOME/{REMOTE_DIR}/workflow-monitor-src"
+
+
+def _update_vector_config(submit, args):
+    """Re-render /etc/vector/vector.toml from the current template and restart.
+
+    Unlike --wire-es this NEVER touches /etc/vector/.env (the live ingest
+    password) or ca.crt -- it only refreshes the config (e.g. to pick up the
+    monitord-events stream), preserving the ES host already wired into the
+    live file. Validates the candidate before replacing the working config.
+    """
+    print("  re-rendering Vector config from the current template")
+    submit.execute(f"mkdir -p ~/{REMOTE_DIR}/vector")
+    submit.upload_file(str(VECTOR_TMPL), f"{REMOTE_DIR}/vector/vector.toml.tmpl")
+    out, _ = submit.execute(
+        "set -e; "
+        # Keep whatever ES endpoint the live config ships to (wire_es may have
+        # sed-ed an override in); fall back to --es-host on a fresh file.
+        "host=$(sudo grep -om1 'https://[^:\"]*:9200' /etc/vector/vector.toml "
+        "2>/dev/null | sed -e 's|https://||' -e 's|:9200||'); "
+        f'[ -n "$host" ] || host={args.es_host}; '
+        f'echo "  ES endpoint preserved: $host"; '
+        f"sed -e 's|__RUNS_DIR__|{args.runs_dir}|g' -e \"s|__ES_HOST__|$host|g\" "
+        f"-e 's|__CA_FILE__|/etc/vector/ca.crt|g' "
+        f"~/{REMOTE_DIR}/vector/vector.toml.tmpl > /tmp/vector.toml.new; "
+        # Validate with the env file loaded (the config references
+        # ${ELASTIC_INGEST_PASSWORD}); abort BEFORE replacing a working config.
+        # --no-environment: skip runtime checks (the LIVE vector holds the disk
+        # -buffer locks, so a full validate would fail spuriously); config parse
+        # + topology + VRL compile still run, which is what a template render
+        # can break. No .env means the node was never --wire-es'd: render the
+        # config but leave Vector alone (wire-es starts it later). sudo test:
+        # /etc/vector is 0750 root:vector, invisible to the ssh user.
+        "if ! sudo test -f /etc/vector/.env; then echo VECTOR_ENV_MISSING; "
+        "elif sudo sh -c 'set -a; . /etc/vector/.env; set +a; "
+        "vector validate --no-environment /tmp/vector.toml.new'; "
+        "then echo VECTOR_VALIDATE_OK; else echo VECTOR_VALIDATE_FAILED; fi"
+    )
+    out = out or ""
+    if "VECTOR_VALIDATE_OK" not in out and "VECTOR_ENV_MISSING" not in out:
+        sys.exit(
+            "error: new vector.toml failed validation; the live config was NOT "
+            "replaced. Inspect /tmp/vector.toml.new on the submit node."
+        )
+    submit.execute(
+        "sudo install -m 0640 -o root -g vector /tmp/vector.toml.new "
+        "/etc/vector/vector.toml"
+    )
+    if "VECTOR_ENV_MISSING" in out:
+        print(
+            "  ! /etc/vector/.env not found (node not --wire-es'd yet): config "
+            "rendered, Vector NOT restarted -- --wire-es will start it."
+        )
+        return
+    submit.execute(
+        "sudo systemctl restart vector && sleep 2 && "
+        "systemctl --no-pager --lines=3 status vector || true"
+    )
+    print("  Vector restarted with the monitord-events stream.")
+
+
+def install_monitord_plugin(slice_obj, args):
+    """Retrofit the monitord plugin stack onto the submit node (idempotent).
+
+    Four steps, in order:
+      1. overlay the 3 pegasus-monitord plugin files onto the apt-installed
+         tree (overlay_monitord_plugin.sh; provenance manifest on the node)
+      2. install the workflow-monitor build that registers the wfmonitor
+         plugin (--monitord-adapter-spec: pip spec or local directory)
+      3. verify the entry point loads with the same python3 the monitord
+         wrapper picks (fails loudly -- monitord would silently run without
+         the plugin otherwise)
+      4. re-render the Vector config (adds the monitord-events stream) and
+         restart Vector
+
+    Run `recipes/elastic-stack/provision.py --apply-schema` FIRST: if Vector
+    restarts before the monitord-events-default alias exists, its first bulk
+    write auto-creates a concrete index squatting on the alias name.
+    """
+    submit = slice_obj.get_node(args.submit_node)
+    print(f"==> installing the monitord plugin stack on '{args.submit_node}'")
+
+    # (1) overlay the pegasus files
+    if not OVERLAY_SH.exists():
+        sys.exit(f"error: {OVERLAY_SH} not found")
+    submit.execute(f"mkdir -p ~/{REMOTE_DIR}/monitord-plugin")
+    submit.upload_file(str(OVERLAY_SH), f"{REMOTE_DIR}/overlay_monitord_plugin.sh")
+    env = f"PEGASUS_PLUGIN_REF={args.pegasus_plugin_ref} "
+    if args.pegasus_src:
+        src = Path(args.pegasus_src).expanduser().resolve()
+        base = src / "packages" / "pegasus-python" / "src" / "Pegasus"
+        for rel in MONITORD_PLUGIN_FILES:
+            local = base / rel
+            if not local.exists():
+                sys.exit(f"error: {local} not found (is --pegasus-src a checkout?)")
+            submit.upload_file(
+                str(local), f"{REMOTE_DIR}/monitord-plugin/{Path(rel).name}"
+            )
+        env += f"SOURCE_MODE=uploaded PEGASUS_SRC_DESC={_git_desc(src)!r} "
+        print(f"  uploaded 3 files from {src} ({_git_desc(src)})")
+    else:
+        env += "SOURCE_MODE=fetch "
+    out, err = submit.execute(
+        f"chmod +x ~/{REMOTE_DIR}/overlay_monitord_plugin.sh && {env}"
+        f"STAGE_DIR=$HOME/{REMOTE_DIR}/monitord-plugin "
+        f"bash ~/{REMOTE_DIR}/overlay_monitord_plugin.sh"
+    )
+    print(out)
+    if "OVERLAY_COMPLETE" not in (out or ""):
+        if err and err.strip():
+            print("  [overlay stderr]\n" + err)
+        sys.exit("error: monitord plugin overlay did not complete")
+
+    # (2) install the adapter build of workflow-monitor
+    spec = args.monitord_adapter_spec
+    local_dir = Path(spec).expanduser()
+    if local_dir.is_dir():
+        print(f"==> uploading local workflow-monitor tree {local_dir}")
+        pip_spec = _upload_adapter_tree(submit, local_dir.resolve())
+        adapter_desc = _git_desc(local_dir)
+    else:
+        pip_spec = spec
+        adapter_desc = spec
+    print(f"==> pip installing workflow-monitor ({adapter_desc})")
+    # Two passes: the first covers dependencies if this node never had
+    # workflow-monitor; the second guarantees the package itself is rebuilt at
+    # the requested ref even though the version number (0.1.0) never moves.
+    out, err = submit.execute(
+        'export PATH="$HOME/.local/bin:$PATH"; '
+        f'python3 -m pip install --user --quiet "{pip_spec}" && '
+        f'python3 -m pip install --user --quiet --force-reinstall --no-deps "{pip_spec}" '
+        "&& echo PIP_OK"
+    )
+    if "PIP_OK" not in (out or ""):
+        print(out)
+        if err and err.strip():
+            print("  [pip stderr]\n" + err)
+        sys.exit("error: workflow-monitor adapter install failed")
+
+    # (3) entry-point check with the interpreter monitord's wrapper resolves
+    # (`which python3` -> /usr/bin/python3, which sees the --user site).
+    out, _ = submit.execute(
+        'python3 -c "from importlib.metadata import entry_points; '
+        "eps = {e.name: e for e in entry_points(group='pegasus.monitord.plugins')}; "
+        "assert 'wfmonitor' in eps, sorted(eps); eps['wfmonitor'].load(); "
+        "print('WFMONITOR_OK')\""
+    )
+    if "WFMONITOR_OK" not in (out or ""):
+        print(out)
+        sys.exit(
+            "error: wfmonitor entry point not loadable by /usr/bin/python3 -- "
+            "pegasus-monitord would run without the plugin"
+        )
+    print("  wfmonitor entry point loads (pegasus.monitord.plugins)")
+
+    # Record the adapter provenance in the overlay manifest.
+    commit_q = (
+        "import importlib.metadata as m, json; "
+        "raw = m.distribution('workflow-monitor').read_text('direct_url.json'); "
+        "d = json.loads(raw) if raw else {}; "
+        "print(d.get('vcs_info', {}).get('commit_id') or d.get('url') or 'unknown')"
+    )
+    commit, _ = submit.execute(f'python3 -c "{commit_q}"', quiet=True)
+    commit = (commit or "unknown").strip().splitlines()[-1]
+    submit.execute(
+        f"sudo python3 -c \"import json; p = '{MONITORD_MANIFEST}'; "
+        "m = json.load(open(p)); "
+        f"m['adapter_spec'] = '{spec}'; m['adapter_resolved'] = '{commit}'; "
+        "m['entry_point_ok'] = True; "
+        "json.dump(m, open(p, 'w'), indent=2)\""
+    )
+    print(f"  adapter resolved: {commit}")
+
+    # (4) refresh Vector so the monitord-events stream ships
+    _update_vector_config(submit, args)
+    print(
+        "  done. Enable per-run with --run-example/--run-workflow "
+        "--enable-monitord-plugin."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Wire Vector to the Elasticsearch slice
 # ---------------------------------------------------------------------------
 
@@ -437,7 +699,9 @@ def _workflow_basename(src):
     return name or "workflow"
 
 
-def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condorio"):
+def _plan_and_monitor(
+    submit, runs, run_name, workdir, wf_file, data_conf="condorio", enable_plugin=False
+):
     """Plan+submit wf_file from workdir into runs/submit/<run_name>, then monitor.
 
     Shared tail of --run-example and --run-workflow. Ensures a no-shared-fs data
@@ -445,6 +709,12 @@ def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condo
     default 'sharedfs' would fail), plans with a deterministic submit dir under
     the runs root, and launches a headless workflow-monitor whose JSONL Vector is
     already tailing. Returns the submit dir.
+
+    With enable_plugin, the run's pegasus.properties also turns on the wfmonitor
+    monitord plugin (deploy/MONITORD-PLUGIN.md), so pegasus-monitord itself
+    writes monitord-events.jsonl into the submit dir live -- the third stream
+    Vector tails -- while the polling-path workflow-monitor keeps running
+    unchanged for side-by-side comparison.
     """
     sub_dir = f"{runs}/submit/{run_name}"
     # Force the pool's data config unless the workflow already chose one. Workers
@@ -455,6 +725,18 @@ def _plan_and_monitor(submit, runs, run_name, workdir, wf_file, data_conf="condo
         "grep -q '^pegasus.data.configuration' pegasus.properties || "
         f"printf 'pegasus.data.configuration=%s\\n' {data_conf} >> pegasus.properties"
     )
+    if enable_plugin:
+        # events_path embeds the run name, and pegasus.properties persists in
+        # the workdir across runs: drop any stale plugin block, then append the
+        # current one. (Properties must be in place before pegasus-plan bakes
+        # them into the submit dir's run properties for monitord.)
+        submit.execute(
+            f"cd {workdir} && "
+            "sed -i '/^pegasus\\.monitord\\.plugins\\./d' pegasus.properties && "
+            "printf 'pegasus.monitord.plugins.wfmonitor.enabled=true\\n"
+            "pegasus.monitord.plugins.wfmonitor.events_path=%s\\n' "
+            f"'{sub_dir}/monitord-events.jsonl' >> pegasus.properties"
+        )
     out, _ = submit.execute(
         f"cd {workdir} && rm -rf {sub_dir} && "
         "pegasus-plan --conf pegasus.properties "
@@ -497,13 +779,21 @@ def run_example(slice_obj, args):
     print("==> running the diamond smoke-test workflow")
     submit = slice_obj.get_node(args.submit_node)
     runs = args.runs_dir
+    # --run-name matters here too: _plan_and_monitor rm -rf's the submit dir,
+    # so a fresh name preserves earlier runs for comparison.
+    run_name = args.run_name or "diamond-run"
     # Generate the abstract workflow + catalogs in the runs dir; diamond.py sets
     # condorio itself, so _plan_and_monitor's guard leaves it intact.
     submit.execute(
         f"cd {runs} && python3 ~/{REMOTE_DIR}/examples/diamond.py 2>&1 | tail -30"
     )
     sub_dir = _plan_and_monitor(
-        submit, runs, "diamond-run", runs, "diamond-workflow.yml"
+        submit,
+        runs,
+        run_name,
+        runs,
+        "diamond-workflow.yml",
+        enable_plugin=args.enable_monitord_plugin,
     )
     print(_watch_hint(sub_dir))
 
@@ -553,7 +843,13 @@ def run_workflow(slice_obj, args):
         f"==> planning {args.workflow_file} from {workdir} (data_conf={args.data_configuration})"
     )
     sub_dir = _plan_and_monitor(
-        submit, runs, run_name, workdir, args.workflow_file, args.data_configuration
+        submit,
+        runs,
+        run_name,
+        workdir,
+        args.workflow_file,
+        args.data_configuration,
+        enable_plugin=args.enable_monitord_plugin,
     )
     print(_watch_hint(sub_dir))
 
@@ -716,7 +1012,8 @@ def parse_args(argv=None):
     p.add_argument(
         "--run-name",
         default=None,
-        help="relative submit-dir name under <runs-dir>/submit (default: <name>-run)",
+        help="relative submit-dir name under <runs-dir>/submit (default: "
+        "diamond-run for --run-example, <name>-run for --run-workflow)",
     )
     p.add_argument(
         "--data-configuration",
@@ -730,6 +1027,44 @@ def parse_args(argv=None):
         action="store_true",
         help="retrofit the Apptainer container runtime onto every node of an "
         "existing slice (idempotent, no condor restart)",
+    )
+
+    # Monitord plugin stack (retrofit; see deploy/MONITORD-PLUGIN.md).
+    p.add_argument(
+        "--install-monitord-plugin",
+        action="store_true",
+        help="retrofit the pegasus-monitord plugin system (3-file overlay) + the "
+        "wfmonitor adapter onto the submit node and restart Vector with the "
+        "monitord-events stream (run elastic-stack --apply-schema FIRST)",
+    )
+    p.add_argument(
+        "--pegasus-plugin-ref",
+        default=MONITORD_PLUGIN_REF,
+        help="pegasus-isi/pegasus commit SHA the 3 monitord plugin files are "
+        "fetched at (full SHA for reproducibility)",
+    )
+    p.add_argument(
+        "--pegasus-src",
+        default=None,
+        metavar="DIR",
+        help="local pegasus checkout to upload the 3 monitord plugin files from, "
+        "instead of fetching --pegasus-plugin-ref from GitHub (iteration loop)",
+    )
+    p.add_argument(
+        "--monitord-adapter-spec",
+        default=MONITORD_ADAPTER_SPEC,
+        metavar="SPEC_OR_DIR",
+        help="pip spec OR local directory for the workflow-monitor build that "
+        "registers the wfmonitor plugin (separate from --workflow-monitor-spec, "
+        "which the fresh bootstrap uses)",
+    )
+    p.add_argument(
+        "--enable-monitord-plugin",
+        action="store_true",
+        help="with --run-example/--run-workflow: write the "
+        "pegasus.monitord.plugins.wfmonitor.* properties into the run so "
+        "pegasus-monitord streams monitord-events.jsonl live "
+        "(needs --install-monitord-plugin done once)",
     )
     p.add_argument(
         "--reconfigure",
@@ -752,11 +1087,21 @@ def main(argv=None):
         return
 
     # Post-hoc actions operate on the EXISTING slice (the ES slice must already
-    # be up for these), so they never rebuild.
-    if args.wire_es or args.run_example or args.run_workflow or args.install_apptainer:
+    # be up for these), so they never rebuild. Install actions run before the
+    # run actions so a one-shot `--install-monitord-plugin --run-example
+    # --enable-monitord-plugin` works.
+    if (
+        args.wire_es
+        or args.run_example
+        or args.run_workflow
+        or args.install_apptainer
+        or args.install_monitord_plugin
+    ):
         slice_obj = fablib.get_slice(args.name)
         if args.install_apptainer:
             install_apptainer(slice_obj, args)
+        if args.install_monitord_plugin:
+            install_monitord_plugin(slice_obj, args)
         if args.wire_es:
             wire_es(slice_obj, args)
         if args.run_example:

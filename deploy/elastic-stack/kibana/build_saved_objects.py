@@ -31,6 +31,7 @@ CORE = "8.15.0"
 DV_EVENTS = "wf-events"
 DV_DIAG = "wf-diag"
 DV_JOBSTATE = "wf-jobstate-current"
+DV_MONITORD = "wf-monitord-events"
 
 
 # --------------------------------------------------------------------------
@@ -187,6 +188,19 @@ def data_views():
             {
                 "title": "workflow-diag-*",
                 "name": "Workflow diagnostics",
+                "timeFieldName": "@timestamp",
+            },
+            type_migration="8.0.0",
+        ),
+        # The pegasus-monitord plugin path (deploy/MONITORD-PLUGIN.md): same
+        # event schema as workflow-events-*, separate family so the plugin
+        # stream and the polling stream compare side by side.
+        so(
+            "index-pattern",
+            DV_MONITORD,
+            {
+                "title": "monitord-events-*",
+                "name": "Monitord plugin events",
                 "timeFieldName": "@timestamp",
             },
             type_migration="8.0.0",

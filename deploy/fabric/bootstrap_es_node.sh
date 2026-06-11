@@ -87,42 +87,18 @@ for _ in $(seq 1 60); do
 done
 
 # --- 5. schema, retention, security ----------------------------------------
-# Provision over localhost on the node (matches deploy/README.md step 3).
+# Shared with the running-cluster retrofit path (provision_es_slice.py
+# --apply-schema): ILM policy, one template per templates/*.json family,
+# write-alias bootstrap, scoped vector_ingest role/user.
+log "applying schema, retention, security (apply_es_schema.sh)"
+ES_DIR="${ES_DIR}" ES_HTTP_PORT="${ES_HTTP_PORT}" \
+  ELASTIC_PASSWORD="${ELASTIC_PASSWORD}" \
+  ELASTIC_INGEST_PASSWORD="${ELASTIC_INGEST_PASSWORD}" \
+  bash "${ES_DIR}/apply_es_schema.sh"
+
+# Section 6 below provisions Kibana over the same endpoint/credentials.
 BASE="https://localhost:${ES_HTTP_PORT}"
 CURL=(curl -sS --cacert "${ES_DIR}/certs/ca/ca.crt" -u "elastic:${ELASTIC_PASSWORD}")
-
-log "applying ILM policy"
-"${CURL[@]}" -X PUT "${BASE}/_ilm/policy/workflow-retention" \
-  -H 'Content-Type: application/json' \
-  -d @"${ES_DIR}/ilm/workflow-retention.json"
-
-log "applying index templates"
-for t in workflow-events workflow-diag; do
-  "${CURL[@]}" -X PUT "${BASE}/_index_template/${t}" \
-    -H 'Content-Type: application/json' \
-    -d @"${ES_DIR}/templates/${t}.json"
-done
-
-log "bootstrapping write aliases (load-bearing for ILM rollover)"
-for fam in workflow-events workflow-diag; do
-  # %3C / %3E are url-encoded < > for the date-math index name.
-  "${CURL[@]}" -X PUT "${BASE}/%3C${fam}-000001%3E" \
-    -H 'Content-Type: application/json' \
-    -d "{\"aliases\":{\"${fam}-default\":{\"is_write_index\":true}}}" || true
-done
-
-log "creating scoped vector_ingest role + user"
-"${CURL[@]}" -X PUT "${BASE}/_security/role/vector_ingest" \
-  -H 'Content-Type: application/json' -d '{
-    "indices": [{
-      "names": ["workflow-events-*", "workflow-diag-*"],
-      "privileges": ["write","create_index","auto_configure","view_index_metadata"]
-    }],
-    "cluster": ["monitor"]
-  }'
-"${CURL[@]}" -X POST "${BASE}/_security/user/vector_ingest" \
-  -H 'Content-Type: application/json' \
-  -d "{\"password\":\"${ELASTIC_INGEST_PASSWORD}\",\"roles\":[\"vector_ingest\"]}"
 
 # --- 6. Kibana (overlay; tunnel-only) --------------------------------------
 # Mint a kibana_system service-account token now that ES is healthy, stash it

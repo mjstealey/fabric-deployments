@@ -87,6 +87,13 @@ ELASTIC_INGEST_PASSWORD=… uv run python recipes/pegasus-htcondor/provision.py 
 # it was part of the bootstrap). Idempotent, no condor restart — safe while live.
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor --install-apptainer
 
+# Retrofit the pegasus-monitord plugin system + the wfmonitor adapter (see
+# deploy/MONITORD-PLUGIN.md). Run the ES side's --apply-schema FIRST. Then
+# opt in per run with --enable-monitord-plugin:
+uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor --install-monitord-plugin
+uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor \
+    --run-example --enable-monitord-plugin --run-name diamond-plugin-3
+
 # Infra + routing only (inspect before installing the stack):
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor
 
@@ -130,3 +137,7 @@ FABRIC side — see [`../../deploy/PEGASUS-HTCONDOR.md`](../../deploy/PEGASUS-HT
 - **`workflow-monitor`** is installed on the submit node from
   `--workflow-monitor-spec` (a `pip`-installable git URL by default). Point it at
   a reachable source (or an uploaded wheel) if the default isn't available.
+  `--install-monitord-plugin` upgrades it separately from
+  `--monitord-adapter-spec` (branch-pinned git URL by default, or a **local
+  directory** that gets tarred + uploaded — the iteration loop in
+  [`../../deploy/MONITORD-PLUGIN.md`](../../deploy/MONITORD-PLUGIN.md)).

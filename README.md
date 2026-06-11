@@ -25,6 +25,14 @@ and the receiver's `--peer-slice` routes back to it. See
 [`deploy/PEGASUS-HTCONDOR.md`](deploy/PEGASUS-HTCONDOR.md) and
 [`deploy/FABRIC.md`](deploy/FABRIC.md) for the authoritative walkthroughs.
 
+The producer ships **three JSONL streams** into three ES index families:
+`workflow-events-*` and `workflow-diag-*` (workflow-monitor's polled stream and
+its stall diagnostics) plus `monitord-events-*` — the same events pushed live
+from *inside* `pegasus-monitord` by its new entry-point plugin system with
+workflow-monitor's `wfmonitor` adapter, kept separate so the push and poll
+paths compare side by side. The plugin test harness is documented in
+[`deploy/MONITORD-PLUGIN.md`](deploy/MONITORD-PLUGIN.md).
+
 > **Related repos.** The example workflows and the
 > [`workflow-monitor`](https://github.com/pegasus-isi/workflow-monitor) project
 > are maintained separately; this repo consumes workflow-monitor's JSONL event
@@ -53,6 +61,7 @@ fabric-deployments/            # uv project root
 ├── deploy/                    # deployment assets
 │   ├── FABRIC.md              #   ES-on-FABRIC walkthrough (receiver)
 │   ├── PEGASUS-HTCONDOR.md    #   Pegasus/HTCondor pool walkthrough (producer)
+│   ├── MONITORD-PLUGIN.md     #   the pegasus-monitord plugin path (push stream)
 │   ├── README.md              #   the Vector → Elasticsearch pipeline
 │   ├── fabric/                #   provision_*_slice.py + in-VM bootstraps
 │   ├── elastic-stack/         #   receiver: ES compose + schema/ILM (certs gitignored)
@@ -255,6 +264,7 @@ Run any of them with `uv run python recipes/<name>/<script>.py`. Run
 
 - [`deploy/FABRIC.md`](deploy/FABRIC.md) — ES-on-FABRIC design + manual path.
 - [`deploy/PEGASUS-HTCONDOR.md`](deploy/PEGASUS-HTCONDOR.md) — producer design + manual path.
+- [`deploy/MONITORD-PLUGIN.md`](deploy/MONITORD-PLUGIN.md) — the monitord plugin path.
 - [`deploy/README.md`](deploy/README.md) — the Vector → Elasticsearch pipeline.
 - FABRIC documentation — <https://learn.fabric-testbed.net/>
 - Pegasus WMS documentation — <https://pegasus.isi.edu/documentation/>

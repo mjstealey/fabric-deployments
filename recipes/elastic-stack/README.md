@@ -53,6 +53,12 @@ uv run python recipes/elastic-stack/provision.py \
 # Infra + routing only (inspect before bringing ES up):
 uv run python recipes/elastic-stack/provision.py --name elasticsearch-host --site UCSD
 
+# Re-apply the schema to the RUNNING cluster (idempotent retrofit; e.g. after a
+# new index family like monitord-events-* — see deploy/MONITORD-PLUGIN.md).
+# Reads ELASTIC_PASSWORD from the node's own ~/elastic-stack/.env; never resets
+# the vector_ingest password or touches existing write indices:
+uv run python recipes/elastic-stack/provision.py --name elasticsearch-host --apply-schema
+
 # Re-apply data-plane IP + route after a node reboot:
 uv run python recipes/elastic-stack/provision.py --name elasticsearch-host --reconfigure
 

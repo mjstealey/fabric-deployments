@@ -30,6 +30,15 @@ include   = ["__RUNS_DIR__/**/diagnostics-events.jsonl"]
 read_from = "beginning"
 fingerprint.strategy = "device_and_inode"
 
+# The pegasus-monitord wfmonitor plugin (deploy/MONITORD-PLUGIN.md) writes this
+# third stream live from inside monitord — same schema as workflow-events.jsonl,
+# but pushed by the plugin instead of polled from the stampede DB.
+[sources.monitord_events]
+type      = "file"
+include   = ["__RUNS_DIR__/**/monitord-events.jsonl"]
+read_from = "beginning"
+fingerprint.strategy = "device_and_inode"
+
 # ── Transforms ───────────────────────────────────────────────────────────
 [transforms.parse_events]
 type   = "remap"
@@ -67,6 +76,24 @@ if exists(.timestamp) {
 .stream      = "workflow_diag"
 '''
 
+[transforms.parse_monitord]
+type   = "remap"
+inputs = ["monitord_events"]
+source = '''
+parsed, err = parse_json(.message)
+if err != null {
+  log("dropping unparseable monitord-events line: " + err, level: "error")
+  abort
+}
+. = parsed
+if exists(.timestamp) {
+  ts_ms = to_int(to_float!(.timestamp) * 1000)
+  .@timestamp = from_unix_timestamp!(ts_ms, unit: "milliseconds")
+}
+.submit_host = get_hostname!()
+.stream      = "monitord_plugin"
+'''
+
 # ── Sinks ────────────────────────────────────────────────────────────────
 # HTTPS + basic auth as the scoped vector_ingest user. tls.ca_file pins the CA
 # pulled back from the ES slice (uploaded by provision_pegasus_slice.py --wire-es).
@@ -100,6 +127,27 @@ auth.password = "${ELASTIC_INGEST_PASSWORD}"
 tls.ca_file   = "__CA_FILE__"
 
 [sinks.es_diag.buffer]
+type      = "disk"
+max_size  = 536870912
+when_full = "block"
+
+# Separate index family so the plugin stream and the polling stream compare
+# side by side. The monitord-events-default alias must exist BEFORE this sink
+# first writes (recipes/elastic-stack --apply-schema), or auto_configure
+# creates a concrete index squatting on the alias name and blocks rollover.
+[sinks.es_monitord]
+type          = "elasticsearch"
+inputs        = ["parse_monitord"]
+endpoints     = ["https://__ES_HOST__:9200"]
+mode          = "bulk"
+api_version   = "v8"
+bulk.index    = "monitord-events-default"
+auth.strategy = "basic"
+auth.user     = "vector_ingest"
+auth.password = "${ELASTIC_INGEST_PASSWORD}"
+tls.ca_file   = "__CA_FILE__"
+
+[sinks.es_monitord.buffer]
 type      = "disk"
 max_size  = 536870912
 when_full = "block"

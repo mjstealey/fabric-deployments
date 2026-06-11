@@ -11,9 +11,10 @@ and **Vector**, which ships workflow events to the **Elasticsearch slice**
  ┌───────────────────────────────────────────────┐         ┌──────────────────────────┐
  │ node "submit": condor CM + schedd + Pegasus   │         │  Elasticsearch 8.15      │
  │   pegasus-monitord → stampede.db              │ FABNetv4│  :9200 (HTTPS+TLS+auth)  │
- │   workflow-monitor --serve → *.jsonl          │  (L3,   │  ILM / templates / alias │
- │   Vector ──── es sink https://<es>:9200 ──────┼─────────▶  vector_ingest user      │
- │ node "work1..N": condor startd (execute)      │ private)└──────────────────────────┘
+ │    └ wfmonitor plugin → monitord-events.jsonl │  (L3,   │  ILM / templates / alias │
+ │   workflow-monitor --serve → *.jsonl          │ private)│  vector_ingest user      │
+ │   Vector ──── es sinks https://<es>:9200 ─────┼─────────▶  3 index families        │
+ │ node "work1..N": condor startd (execute)      │         └──────────────────────────┘
  │   all nodes on ONE FABNetv4 network "fabnet"  │
  └───────────────────────────────────────────────┘
         slice A (same project)                                  slice B (same project)
@@ -31,7 +32,11 @@ This is the slice the `elastic-stack` recipe assumed already existed (its
 >   Apptainer everywhere, workflow-monitor + Vector on the submit node). Also
 >   runnable by hand.
 > - `pegasus-htcondor/condor/` — the HTCondor config drop-ins.
-> - `pegasus-htcondor/vector/vector.toml.tmpl` — the node Vector config.
+> - `pegasus-htcondor/vector/vector.toml.tmpl` — the node Vector config (three
+>   streams: workflow-events, diagnostics, monitord-events).
+> - `pegasus-htcondor/overlay_monitord_plugin.sh` — overlays the
+>   pegasus-monitord plugin system onto the apt install
+>   ([`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md)).
 > - `pegasus-htcondor/examples/diamond.py` — the smoke-test workflow.
 
 ---
@@ -173,6 +178,33 @@ What it relies on, and the knobs:
 > The receiver side never changes. The ES index templates and Vector transforms
 > are workflow-agnostic — any workflow whose `workflow-monitor` JSONL lands under
 > the runs root is ingested. See [`README.md`](README.md) and [`FABRIC.md`](FABRIC.md).
+
+---
+
+## Testing the monitord plugin path
+
+The pool can also exercise the **pegasus-monitord entry-point plugin system**
+(pegasus branch `monitord-plugin-system`) with workflow-monitor's `wfmonitor`
+adapter (branch `monitord-plugin-adapter`): monitord itself streams
+`monitord-events.jsonl` live, alongside the polling path, into a separate
+`monitord-events-*` index family. Full architecture, provenance mechanism, and
+verification runbook: [`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md).
+
+```bash
+# Receiver first (adds the monitord-events-* template/alias/role, idempotent):
+uv run python recipes/elastic-stack/provision.py --apply-schema
+
+# Retrofit the submit node (3-file overlay + adapter + Vector stream), once:
+uv run python recipes/pegasus-htcondor/provision.py --install-monitord-plugin
+
+# Then opt in per run:
+uv run python recipes/pegasus-htcondor/provision.py \
+    --run-example --enable-monitord-plugin --run-name diamond-plugin-3
+```
+
+That order matters — apply the ES schema before the Vector restart, or the
+first bulk write auto-creates a concrete index squatting on the
+`monitord-events-default` alias name.
 
 ---
 
@@ -418,6 +450,15 @@ reference.
       --name pegasus-htcondor --install-apptainer
   ```
   (`--run-workflow` itself needs nothing on the slice — it is driver-side.)
+- **Retrofitting the monitord plugin stack:** `--install-monitord-plugin`
+  (see [`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md)). Idempotent; restarts only
+  Vector, never condor. Unlike `--wire-es` it does not touch
+  `/etc/vector/.env` or the CA.
+- **Re-running `--wire-es` overwrites `/etc/vector/.env`** with
+  `--ingest-password` (default `changeme-vector-ingest`!). On a wired node,
+  pass the real `ELASTIC_INGEST_PASSWORD` or don't re-run it — use
+  `--install-monitord-plugin` (config-only refresh) or `--reconfigure`
+  (routes) for maintenance instead.
 - **Multiple producer slices → one ES.** Each pool ships to the same
   `workflow-monitor-es` over its own FABNet route; ES is the shared sink. Switch
   Vector to **API keys** (one per submit host) so any one can be revoked
@@ -430,12 +471,15 @@ reference.
 ```
 deploy/
 ├── PEGASUS-HTCONDOR.md           # ← you are here
+├── MONITORD-PLUGIN.md            # the monitord plugin path (overlay + adapter + 3rd stream)
 ├── fabric/
-│   ├── provision_pegasus_slice.py  # FABlib: create pool, route, bootstrap, apptainer, wire-es, run
+│   ├── provision_pegasus_slice.py  # FABlib: create pool, route, bootstrap, apptainer,
+│   │                                #   monitord-plugin, wire-es, run
 │   └── ca.crt                       # the ES CA, downloaded by the elastic-stack recipe (gitignored)
 └── pegasus-htcondor/
     ├── bootstrap_pegasus_node.sh    # role-aware in-VM bring-up (uploaded + run by ↑)
     ├── install_apptainer.sh         # container-runtime install (bootstrap + --install-apptainer)
+    ├── overlay_monitord_plugin.sh   # monitord plugin-system overlay (--install-monitord-plugin)
     ├── .pool-password               # generated shared pool key (gitignored)
     ├── condor/                      # HTCondor config drop-ins (rendered per node)
     ├── vector/vector.toml.tmpl      # node Vector config (rendered to /etc/vector/vector.toml)

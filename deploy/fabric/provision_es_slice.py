@@ -18,6 +18,8 @@ What it does
              SAN, `docker compose up`, and apply ILM/templates/aliases/role/user
   peer       (--peer-slice NAME) on each node of the peer slice, add the reverse
              route and an /etc/hosts entry so Vector can reach this ES by name
+  schema     (--apply-schema) re-apply ILM/templates/aliases/role to the RUNNING
+             cluster -- the idempotent retrofit for new index families
   handoff    print the exact vector.toml edits for the Pegasus slice
 
 Usage
@@ -217,17 +219,19 @@ def bootstrap_es(node, es_ip, args):
             f"{REMOTE_STACK}/docker-compose.kibana.yml",
         ),
         (
-            ELASTIC_STACK / "templates" / "workflow-events.json",
-            f"{REMOTE_STACK}/templates/workflow-events.json",
-        ),
-        (
-            ELASTIC_STACK / "templates" / "workflow-diag.json",
-            f"{REMOTE_STACK}/templates/workflow-diag.json",
+            ELASTIC_STACK / "apply_es_schema.sh",
+            f"{REMOTE_STACK}/apply_es_schema.sh",
         ),
         (
             ELASTIC_STACK / "ilm" / "workflow-retention.json",
             f"{REMOTE_STACK}/ilm/workflow-retention.json",
         ),
+    ]
+    # One template per index family; apply_es_schema.sh derives the families
+    # (aliases, role grants) from whatever lands in templates/.
+    uploads += [
+        (t, f"{REMOTE_STACK}/templates/{t.name}")
+        for t in sorted((ELASTIC_STACK / "templates").glob("*.json"))
     ]
     for local, remote in uploads:
         if not local.exists():
@@ -266,6 +270,62 @@ def bootstrap_es(node, es_ip, args):
         print(
             f"  ! could not download CA ({exc}); fetch ~/{REMOTE_STACK}/certs/ca/ca.crt by hand"
         )
+
+
+# ---------------------------------------------------------------------------
+# Schema re-apply (post-hoc; the slice must be bootstrapped)
+# ---------------------------------------------------------------------------
+
+
+def apply_schema(fablib, args):
+    """Re-apply ILM/templates/write-aliases/role to the RUNNING cluster.
+
+    Retrofit path for schema additions on an existing bootstrapped slice --
+    e.g. the monitord-events-* family that ships the pegasus-monitord plugin
+    stream (deploy/MONITORD-PLUGIN.md). Uploads the current ilm/ + templates/
+    assets plus apply_es_schema.sh and runs it on the node, which reads
+    ELASTIC_PASSWORD from its own ~/elastic-stack/.env (no secrets cross the
+    wire). Idempotent: existing write indices and the vector_ingest password
+    are never touched.
+
+    Order matters for new families: apply the schema BEFORE pointing a Vector
+    sink at the new alias, or the first bulk write auto-creates a concrete
+    index squatting on the alias name (the script detects and explains this).
+    """
+    print(f"==> applying ES schema to slice '{args.name}'")
+    slice_obj = fablib.get_slice(args.name)
+    node, _, _ = _node_fabnet(slice_obj, args.node)
+    if node is None:
+        sys.exit("error: no node found in slice")
+
+    node.execute(f"mkdir -p ~/{REMOTE_STACK}/templates ~/{REMOTE_STACK}/ilm")
+    uploads = [
+        (ELASTIC_STACK / "apply_es_schema.sh", f"{REMOTE_STACK}/apply_es_schema.sh"),
+        (
+            ELASTIC_STACK / "ilm" / "workflow-retention.json",
+            f"{REMOTE_STACK}/ilm/workflow-retention.json",
+        ),
+    ] + [
+        (t, f"{REMOTE_STACK}/templates/{t.name}")
+        for t in sorted((ELASTIC_STACK / "templates").glob("*.json"))
+    ]
+    for local, remote in uploads:
+        if not local.exists():
+            sys.exit(f"error: missing {local}")
+        node.upload_file(str(local), remote)
+    print(f"  uploaded {len(uploads)} schema assets to ~/{REMOTE_STACK}")
+
+    print("  running apply_es_schema.sh on the node...")
+    cmd = (
+        f"set -a; . ~/{REMOTE_STACK}/.env; set +a; "
+        f"ES_DIR=$HOME/{REMOTE_STACK} ES_HTTP_PORT={args.es_http_port} "
+        f"bash ~/{REMOTE_STACK}/apply_es_schema.sh"
+    )
+    out, err = node.execute(cmd, quiet=True)
+    if out:
+        print(out)
+    if err and err.strip():
+        print("  [apply-schema stderr]\n" + err)
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +555,13 @@ def parse_args(argv=None):
     )
 
     p.add_argument(
+        "--apply-schema",
+        action="store_true",
+        help="re-apply ILM/templates/write-aliases/role to the RUNNING cluster "
+        "(idempotent retrofit, e.g. after adding an index family such as "
+        "monitord-events-*; slice must be bootstrapped)",
+    )
+    p.add_argument(
         "--push-kibana",
         action="store_true",
         help="upload deploy/elastic-stack/kibana/ to the node and import the "
@@ -527,9 +594,13 @@ def main(argv=None):
     if args.reconfigure:
         reconfigure(fablib, args)
         return
-    # Post-hoc action on the EXISTING slice; never rebuilds.
-    if args.push_kibana:
-        push_kibana(fablib, args)
+    # Post-hoc actions on the EXISTING slice; never rebuild. Schema first so a
+    # combined --apply-schema --push-kibana lands data views on live indices.
+    if args.apply_schema or args.push_kibana:
+        if args.apply_schema:
+            apply_schema(fablib, args)
+        if args.push_kibana:
+            push_kibana(fablib, args)
         return
 
     slice_obj = build(fablib, args)

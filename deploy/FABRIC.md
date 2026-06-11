@@ -369,6 +369,15 @@ If you skip persistent storage, ES data lives on the node's root disk
 - **Reboots.** After a node reboot, re-apply data-plane config:
   `python deploy/fabric/provision_es_slice.py --name <slice> --reconfigure`,
   or `slice.get_node(...).config()` from FABlib.
+- **Schema changes on a running cluster.** `--apply-schema` re-applies
+  ILM/templates/write-aliases/the `vector_ingest` role idempotently
+  (`elastic-stack/apply_es_schema.sh`; one template file per index family —
+  drop a new `templates/*.json` in and re-run). Existing write indices and the
+  `vector_ingest` password are never touched. **Apply the schema before
+  pointing a new Vector sink at a new alias** — a sink that writes first
+  auto-creates a concrete index squatting on the alias name, blocking ILM
+  rollover (the script detects this and prints the remediation). Used to add
+  the `monitord-events-*` family ([`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md)).
 
 ---
 
@@ -447,6 +456,22 @@ reboot.
 > route; Vector immediately drained the day's queued events into ES (count
 > 838 → 1175).
 
+> **Worked example (2026-06-11).** A Vector restart (adding the monitord-events
+> sink) immediately logged `Network is unreachable (os error 101)` — harder
+> failure than a timeout, and this time **both** slices were missing the
+> `10.128.0.0/10` route (each node still had its FABNet IP). `--reconfigure` on
+> *both* slices restored it; Vector's sinks went healthy and drained the
+> backlog (the 88 queued monitord events landed within seconds). Same runbook,
+> two routes.
+
+The walk above applies unchanged to the `monitord-events-*` stream (it shares
+the Vector instance and route); substitute the index pattern in step 1. One
+extra failure mode is specific to a **new** stream: if
+`GET /_alias/monitord-events-default` 404s but `GET /monitord-events-default`
+returns an index, the sink wrote before `--apply-schema` ran and auto-created
+a concrete index on the alias name — reindex if the stray docs matter, DELETE
+it, then re-run `--apply-schema` (which prints exactly this).
+
 ---
 
 ## Alternatives
@@ -465,9 +490,10 @@ reboot.
 deploy/
 ├── FABRIC.md                     # ← you are here
 ├── fabric/
-│   ├── provision_es_slice.py     # FABlib: create slice, route, bootstrap
+│   ├── provision_es_slice.py     # FABlib: create slice, route, bootstrap, apply-schema
 │   ├── bootstrap_es_node.sh      # in-VM ES bring-up (uploaded + run by ↑)
 │   └── ca.crt                    # downloaded CA after bootstrap (gitignored)
-├── elastic-stack/                # reused unchanged (receiver: ES + schema)
+├── elastic-stack/                # receiver: ES + schema
+│   └── apply_es_schema.sh        # idempotent schema apply (bootstrap + --apply-schema)
 └── vector/                       # reused; only sink endpoints/CA path change
 ```

@@ -50,6 +50,21 @@ it (and expect all-PASS) before provisioning, and after any `config/fabric_rc` e
   load-bearing:** both provisioners share `NET_NAME = "fabnet"`, which is what
   lets the ES side's `--peer-slice pegasus-htcondor` route back to the pool
   unmodified. Read `deploy/PEGASUS-HTCONDOR.md` before changing producer behavior.
+- **The monitord plugin path is a retrofit, not a rebuild.** The pegasus-monitord
+  entry-point plugin system (pegasus branch `monitord-plugin-system`, pure
+  Python) is overlaid onto the apt-installed Pegasus by
+  `--install-monitord-plugin` (3 files + provenance manifest on the node +
+  workflow-monitor `wfmonitor` adapter + Vector's third stream); runs opt in via
+  `--enable-monitord-plugin`. The plugin stream gets its OWN index family
+  `monitord-events-*` so push vs poll compare side by side. **Ordering rule:**
+  run the ES side's `--apply-schema` BEFORE any Vector restart that adds a sink
+  for a new family — a sink writing first auto-creates a concrete index on the
+  alias name and blocks rollover. Read `deploy/MONITORD-PLUGIN.md` first.
+- **ES schema changes go through `deploy/elastic-stack/apply_es_schema.sh`**
+  (shared by fresh bootstrap and the `--apply-schema` retrofit). One
+  `templates/*.json` file per index family — aliases and the `vector_ingest`
+  role grants are derived from the template filenames. It never resets the
+  `vector_ingest` password or touches existing write indices.
 - **Config resolution (FABlib 2.0.6).** Precedence is constructor args ▸
   `fabric_rc` file ▸ env vars ▸ defaults. FABlib does **not** read a `FABRIC_RC`
   env var; with no constructor arg it reads `~/work/fabric_config/fabric_rc`.
@@ -68,6 +83,9 @@ it (and expect all-PASS) before provisioning, and after any `config/fabric_rc` e
   that mirrors it: `deploy/vector/vector.toml` (and the `vector.toml.tmpl` for the
   FABRIC submit node) tail the JSONL it writes, and `deploy/elastic-stack/templates/`
   map its fields. Keep them in step with `DATA_SOURCES.md` when the schema changes.
+  The monitord plugin stream (`monitord-events.jsonl`) follows the SAME schema —
+  its producer is the `wfmonitor` adapter in workflow-monitor (branch
+  `monitord-plugin-adapter`).
   Note: the `deploy/` pipeline assets (Vector config, ES templates/ILM) were
   removed from the workflow-monitor repo (they were only ever on a deleted branch)
   and now live here exclusively.

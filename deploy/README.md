@@ -99,12 +99,15 @@ deploy/
 ├── elastic-stack/                  # Receiver: ES cluster + schema + retention
 │   ├── docker-compose.yml          #   Single-node ES (8.15.0), TLS, security on
 │   ├── .env                        #   ELASTIC_PASSWORD — gitignored
+│   ├── apply_es_schema.sh          #   Idempotent schema apply (fresh bootstrap +
+│   │                                #   running-cluster retrofit; one template = one family)
 │   ├── certs/                      #   Self-signed CA + node cert (gitignored)
 │   │   ├── ca/   {ca.crt, ca.key}
 │   │   └── node/ {node.crt, node.key}
 │   ├── templates/                  #   Index templates (mappings + ILM ref)
 │   │   ├── workflow-events.json
-│   │   └── workflow-diag.json
+│   │   ├── workflow-diag.json
+│   │   └── monitord-events.json    #   the monitord plugin stream (MONITORD-PLUGIN.md)
 │   └── ilm/
 │       └── workflow-retention.json #   Rollover at 10 GB/7 d, delete at 90 d
 └── vector/                         # Shipper: file → ES
@@ -125,18 +128,25 @@ them before exposing the cluster.
 
 ## What gets ingested
 
-Two JSONL streams written by workflow-monitor, one document per line:
+Three JSONL streams, one document per line:
 
 | Stream | Source file | Vector source | Sink → ES index alias |
 |---|---|---|---|
 | Workflow events | `<submit_dir>/workflow-events.jsonl` | `sources.workflow_events` | `workflow-events-default` |
 | Diagnostics events | `<submit_dir>/diagnostics-events.jsonl` | `sources.workflow_diag` | `workflow-diag-default` |
+| Monitord plugin events | `<submit_dir>/monitord-events.jsonl` | `sources.monitord_events` | `monitord-events-default` |
 
 Workflow events include every state transition pegasus-monitord reports
 plus the monitor's own snapshots (job start/end, retries, workflow
 start/end, periodic `htcondor_poll` ClassAd dumps). Diagnostics events
 are emitted by the `--diagnose` mode's stall detector — at most one
-per stall episode plus a recovery record.
+per stall episode plus a recovery record. Monitord plugin events are the
+same authoritative schema as workflow events but emitted live from
+*inside* `pegasus-monitord` by the `wfmonitor` plugin — the push
+counterpart to the polled stream, kept in its own index family so the
+two paths compare side by side (see
+[`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md); on the FABRIC submit node
+only, when a run opts in).
 
 The Vector pipeline:
 
