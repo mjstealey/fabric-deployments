@@ -710,6 +710,8 @@ def _plan_and_monitor(
     tick_interval=5.0,
     condor_poll=True,
     enable_wfevents=False,
+    wfevents_condor_poll=False,
+    serve=True,
 ):
     """Plan+submit wf_file from workdir into runs/submit/<run_name>, then monitor.
 
@@ -732,7 +734,13 @@ def _plan_and_monitor(
     plugin (mjstealey/pegasus-monitord-plugins, installed separately with pip
     --user), which writes wfevents.jsonl into the submit dir — same schema,
     consumable by workflow-monitor --remote/--replay. Vector does NOT tail it.
-    Its condor polling stays off so two plugins never poll the same schedd.
+    wfevents_condor_poll gives the condor polling to wfevents instead (same
+    tick_interval cadence) — enable it on ONE plugin only.
+
+    serve=False skips the headless workflow-monitor --serve daemon entirely:
+    no workflow-events.jsonl is written, so nothing from the run reaches ES
+    unless a monitord plugin stream is enabled. Use for pure plugin runs
+    observed via workflow-monitor --remote.
     """
     sub_dir = f"{runs}/submit/{run_name}"
     # Force the pool's data config unless the workflow already chose one. Workers
@@ -764,6 +772,17 @@ def _plan_and_monitor(
                 "pegasus.monitord.plugins.wfevents.enabled=true",
                 f"pegasus.monitord.plugins.wfevents.events_path={sub_dir}/wfevents.jsonl",
             ]
+            if wfevents_condor_poll:
+                if enable_plugin and condor_poll:
+                    print(
+                        "  ! both wfmonitor and wfevents have condor_poll on — "
+                        "they will double-poll the schedd (pass "
+                        "--no-monitord-condor-poll to give polling to wfevents)"
+                    )
+                plugin_props += [
+                    f"pegasus.monitord.plugins.wfevents.tick_interval={tick_interval:g}",
+                    "pegasus.monitord.plugins.wfevents.condor_poll=true",
+                ]
         block = "\\n".join(plugin_props) + "\\n"
         submit.execute(
             f"cd {workdir} && "
@@ -778,21 +797,33 @@ def _plan_and_monitor(
         f"--submit {wf_file} 2>&1 | tail -40"
     )
     print(out)
-    # Headless monitor: writes workflow-events.jsonl + diagnostics-events.jsonl
-    # into the submit dir, which Vector is already tailing.
-    submit.execute(
-        # ~/.local/bin (pip --user install of workflow-monitor) is not on PATH for
-        # non-interactive SSH (Ubuntu's .bashrc early-returns), so make it explicit.
-        'export PATH="$HOME/.local/bin:$PATH"; '
-        # pegasus-monitord creates the stampede DB a few seconds AFTER submit, and
-        # workflow-monitor --serve exits immediately if it is not there yet. Wait
-        # for it (up to ~60s) before launching the monitor.
-        f"for i in $(seq 1 30); do ls {sub_dir}/*.stampede.db >/dev/null 2>&1 && break; sleep 2; done; "
-        f"nohup workflow-monitor {sub_dir} --serve --diagnose --log "
-        f">{runs}/monitor-{run_name}.out 2>&1 & sleep 8; "
-        f"ls -l {sub_dir}/workflow-events.jsonl 2>/dev/null || "
-        "echo 'no JSONL yet — check pegasus-monitord / workflow-monitor output'"
-    )
+    if serve:
+        # Headless monitor: writes workflow-events.jsonl + diagnostics-events.jsonl
+        # into the submit dir, which Vector is already tailing.
+        submit.execute(
+            # ~/.local/bin (pip --user install of workflow-monitor) is not on PATH for
+            # non-interactive SSH (Ubuntu's .bashrc early-returns), so make it explicit.
+            'export PATH="$HOME/.local/bin:$PATH"; '
+            # pegasus-monitord creates the stampede DB a few seconds AFTER submit, and
+            # workflow-monitor --serve exits immediately if it is not there yet. Wait
+            # for it (up to ~60s) before launching the monitor.
+            f"for i in $(seq 1 30); do ls {sub_dir}/*.stampede.db >/dev/null 2>&1 && break; sleep 2; done; "
+            f"nohup workflow-monitor {sub_dir} --serve --diagnose --log "
+            f">{runs}/monitor-{run_name}.out 2>&1 & sleep 8; "
+            f"ls -l {sub_dir}/workflow-events.jsonl 2>/dev/null || "
+            "echo 'no JSONL yet — check pegasus-monitord / workflow-monitor output'"
+        )
+    else:
+        print(
+            "  --no-serve-monitor: skipping workflow-monitor --serve "
+            "(no workflow-events.jsonl for this run)"
+        )
+        if enable_wfevents:
+            submit.execute(
+                f"for i in $(seq 1 30); do ls {sub_dir}/wfevents.jsonl >/dev/null 2>&1 && break; sleep 2; done; "
+                f"ls -l {sub_dir}/wfevents.jsonl 2>/dev/null || "
+                "echo 'no wfevents.jsonl yet — check pegasus-monitord output'"
+            )
     return sub_dir
 
 
@@ -830,6 +861,8 @@ def run_example(slice_obj, args):
         tick_interval=args.monitord_tick_interval,
         condor_poll=args.monitord_condor_poll,
         enable_wfevents=args.enable_wfevents_plugin,
+        wfevents_condor_poll=args.wfevents_condor_poll,
+        serve=args.serve_monitor,
     )
     print(_watch_hint(sub_dir))
 
@@ -889,6 +922,8 @@ def run_workflow(slice_obj, args):
         tick_interval=args.monitord_tick_interval,
         condor_poll=args.monitord_condor_poll,
         enable_wfevents=args.enable_wfevents_plugin,
+        wfevents_condor_poll=args.wfevents_condor_poll,
+        serve=args.serve_monitor,
     )
     print(_watch_hint(sub_dir))
 
@@ -1122,6 +1157,23 @@ def parse_args(argv=None):
         "Vector does not tail it). Install it once on the submit node: "
         "python3 -m pip install --user 'git+https://github.com/mjstealey/"
         "pegasus-monitord-plugins.git#subdirectory=plugins/wfevents'",
+    )
+    p.add_argument(
+        "--wfevents-condor-poll",
+        action="store_true",
+        help="with --enable-wfevents-plugin: let the wfevents plugin poll "
+        "condor_q/history/status from its tick() (cadence from "
+        "--monitord-tick-interval). Enable polling on ONE plugin only — "
+        "combine with --no-monitord-condor-poll if wfmonitor is also enabled.",
+    )
+    p.add_argument(
+        "--serve-monitor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="start the headless workflow-monitor --serve for the run (writes "
+        "workflow-events.jsonl, the stream Vector ships to ES). "
+        "--no-serve-monitor skips it — e.g. for a pure wfevents run observed "
+        "with workflow-monitor --remote.",
     )
     p.add_argument(
         "--monitord-condor-poll",
