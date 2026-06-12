@@ -19,13 +19,9 @@ on the `pegasus-htcondor` slice; docs in the `elasticsearch-host` slice's
 ### 1a. Pegasus side — the plugin host (branch `monitord-plugin-system`)
 
 Pure-Python addition to `pegasus-monitord`, pinned in this repo at commit
-`c3d6be8735f89a3d25d0419695bcc91b44333a24` (the entry-point system **plus the
-cross-thread payload race fix**, see §6). The local branch tip `2a6a23fca`
-additionally adds the **tick() hook** — until that commit is pushed to
-GitHub, deploy the tick-capable files with `--pegasus-src <local checkout>`
-(the SHA-pinned fetch default predates tick), then bump `MONITORD_PLUGIN_REF`
-in `provision_pegasus_slice.py`. Three files under
-`packages/pegasus-python/src/Pegasus/`:
+`2a6a23fca065c5bcadd0fd0273588097d92a04d3` (= branch tip: the entry-point
+system, the cross-thread payload race fix, **and the tick() hook** — see §6).
+Three files under `packages/pegasus-python/src/Pegasus/`:
 
 | File | Status | Role |
 |---|---|---|
