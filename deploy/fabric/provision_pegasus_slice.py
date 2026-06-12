@@ -111,9 +111,11 @@ CONDOR_FILES = [
 
 # --- monitord plugin stack (deploy/MONITORD-PLUGIN.md) ----------------------
 # The pegasus-monitord entry-point plugin system is pure Python: these three
-# files overlaid onto the apt-installed tree ARE the install. Pinned to the
-# tip of pegasus-isi/pegasus branch monitord-plugin-system (includes the
-# cross-thread payload race fix).
+# files overlaid onto the apt-installed tree ARE the install. Pinned to
+# pegasus-isi/pegasus branch monitord-plugin-system (includes the cross-thread
+# payload race fix). NOTE: the tick() hook (local commit 2a6a23fca) is NOT in
+# this ref yet -- until that commit is pushed, deploy tick-capable files with
+# --pegasus-src <local checkout>, then bump this to the pushed SHA.
 MONITORD_PLUGIN_REF = "c3d6be8735f89a3d25d0419695bcc91b44333a24"
 MONITORD_PLUGIN_FILES = [  # repo-relative under packages/pegasus-python/src/Pegasus/
     "monitoring/plugin.py",

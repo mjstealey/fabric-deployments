@@ -19,8 +19,12 @@ on the `pegasus-htcondor` slice; docs in the `elasticsearch-host` slice's
 ### 1a. Pegasus side — the plugin host (branch `monitord-plugin-system`)
 
 Pure-Python addition to `pegasus-monitord`, pinned in this repo at commit
-`c3d6be8735f89a3d25d0419695bcc91b44333a24` (= branch tip: the entry-point
-system **plus the cross-thread payload race fix**, see §6). Three files under
+`c3d6be8735f89a3d25d0419695bcc91b44333a24` (the entry-point system **plus the
+cross-thread payload race fix**, see §6). The local branch tip `2a6a23fca`
+additionally adds the **tick() hook** — until that commit is pushed to
+GitHub, deploy the tick-capable files with `--pegasus-src <local checkout>`
+(the SHA-pinned fetch default predates tick), then bump `MONITORD_PLUGIN_REF`
+in `provision_pegasus_slice.py`. Three files under
 `packages/pegasus-python/src/Pegasus/`:
 
 | File | Status | Role |
@@ -42,6 +46,14 @@ Mechanics:
   rather than ever blocking monitord; a wedged plugin is abandoned after
   `…<name>.join_timeout` (default 10s). A crashing plugin never kills monitord.
 - Event payloads are **snapshotted at enqueue** (`dict(kw)`) — the race fix.
+- **`tick()`** (added in `2a6a23fca`): with `…<name>.tick_interval` set to a
+  positive number of seconds, the plugin's *existing* worker thread waits with
+  `get(timeout=…)` and calls `plugin.tick()` when the queue is idle (plus a
+  starvation guard that ticks between events under continuous flow) — wall
+  -clock callbacks with **no additional thread**, on the same thread as
+  `handle_event` (no locking between them), exception-isolated identically,
+  and never after the shutdown sentinel. Default `0` = the byte-identical
+  blocking loop as before.
 
 ### 1b. workflow-monitor side — the `wfmonitor` adapter (branch `monitord-plugin-adapter`)
 
@@ -60,6 +72,21 @@ keeps its own correlation state (job/task roster maps) in place of the
 stampede-DB joins, and demultiplexes nothing: one monitord, one workflow, one
 file.
 
+**With `condor_poll=true`** the plugin also absorbs the HTCondor polling the
+standalone `--serve` loop performs: its `tick()` runs gated
+`condor_q`/`condor_history`/`condor_status` queries and emits
+`htcondor_poll`/`htcondor_history`/`pool_status` into the same JSONL —
+**one process, one writer, no thread whose only job is polling condor**.
+Mechanics mirror `server.py` exactly: queries scoped to the workflow with the
+same `Cmd`-prefix constraint (built from `wf.plan`'s planner-recorded
+`submit_dir`; the plugin never polls before `wf.plan`), a plugin-private
+`CondorBackoff` (exponential backoff on schedd failure; history/pool skipped
+while failing), history at ≥ 3× the tick base (min 10s) emitting the full
+ClusterId-deduped merged cache, pool at ≥ 5× (min 15s), fingerprint dedup
+reusing `EventLogger`'s helpers, and a final queue/history/pool flush in
+`stop()` for terminal ClassAds. When the plugin polls condor, start `--serve`
+with **`--no-condor-poll`** so the two paths don't double-poll the schedd.
+
 Properties (read from the run's `pegasus.properties`, prefix
 `pegasus.monitord.plugins.wfmonitor.`):
 
@@ -68,6 +95,9 @@ Properties (read from the run's `pegasus.properties`, prefix
 | `enabled` | `false` | must be `true` for monitord to start the plugin |
 | `events_path` | `./monitord-events.jsonl` | output JSONL (use an absolute path under the runs root so Vector's glob sees it) |
 | `restart` | `false` | truncate instead of append |
+| `tick_interval` | `0` (no ticks) | host-level: tick cadence in seconds; also the condor-poll base the adapter sub-throttles from |
+| `condor_poll` | `false` | poll condor from `tick()` and emit the three condor event types |
+| `schedd`, `collector`, `token_path`, `cert_path`, `key_path`, `password_file` | unset | optional passthroughs to the condor queries (not needed on this pool — FS auth as the submitting user) |
 
 ---
 
@@ -150,10 +180,15 @@ run's `pegasus.properties` before `pegasus-plan`:
 ```
 pegasus.monitord.plugins.wfmonitor.enabled=true
 pegasus.monitord.plugins.wfmonitor.events_path=/opt/workflows/submit/<run-name>/monitord-events.jsonl
+pegasus.monitord.plugins.wfmonitor.tick_interval=5      # --monitord-tick-interval
+pegasus.monitord.plugins.wfmonitor.condor_poll=true     # omit with --no-monitord-condor-poll
 ```
 
 (the stale block from a previous run is sed-deleted first — `events_path`
-embeds the run name). Without the flag, runs behave exactly as before.
+embeds the run name). Without the flag, runs behave exactly as before;
+`--no-monitord-condor-poll` is the regression configuration (plugin on,
+condor polling off — only the four pegasus event types, ~88 events for the
+diamond example).
 
 ---
 
@@ -161,14 +196,17 @@ embeds the run name). Without the flag, runs behave exactly as before.
 
 The polling-path `workflow-monitor --serve` keeps running unchanged on every
 run, so the same workflow produces both telemetry paths for side-by-side
-comparison — deliberately, as input to the next investigation (folding the
-HTCondor polling into the plugin instead of two interleaved collectors).
+comparison. (That investigation — folding the HTCondor polling into the
+plugin instead of two interleaved collectors — is now **implemented** via the
+tick() + `condor_poll` mechanism above; `--serve` is kept polling on these
+test runs precisely to generate the comparison data. A production
+single-path setup would run `--serve --no-condor-poll`.)
 
 | JSONL in the submit dir | Producer | Vector `stream` tag | ES index family |
 |---|---|---|---|
 | `workflow-events.jsonl` | workflow-monitor `--serve` (polls stampede DB + condor_q/history/status) | `workflow_events` | `workflow-events-*` |
 | `diagnostics-events.jsonl` | workflow-monitor `--serve --diagnose` (stall detection) | `workflow_diag` | `workflow-diag-*` |
-| `monitord-events.jsonl` | **pegasus-monitord, via the wfmonitor plugin** | `monitord_plugin` | `monitord-events-*` |
+| `monitord-events.jsonl` | **pegasus-monitord, via the wfmonitor plugin** (pegasus events pushed live + condor polls from tick()) | `monitord_plugin` | `monitord-events-*` |
 
 All three are tailed by the same Vector instance
 (`deploy/pegasus-htcondor/vector/vector.toml.tmpl`) with identical transforms
@@ -180,9 +218,12 @@ reuses the `workflow-retention` ILM policy. Kibana gets a
 
 Notable comparison points observed on the diamond runs:
 
-- The plugin path emits **88 events** for a 12-job diamond run — pure state
-  transitions. The polling path emits more (~100+) because it also snapshots
-  `htcondor_poll` / `htcondor_history` / `pool_status` records.
+- Without `condor_poll`, the plugin path emits **88 events** for a 12-job
+  diamond run — pure state transitions. With it (`diamond-tick-2`,
+  2026-06-12), the plugin emitted **103** events: the same 88 plus
+  `htcondor_poll: 7`, `htcondor_history: 3`, `pool_status: 5` — and the
+  polling path's counts for the same run were `8/3/5`. The two collectors see
+  near-identical condor activity at a 5s tick vs the 2s serve loop.
 - Plugin events appear in the JSONL **as monitord processes them** (line
   -buffered), i.e. seconds before the polling path can see the same
   transition land in the stampede DB and be polled back out.
@@ -197,8 +238,15 @@ On the **submit** node, after a run with the plugin enabled
 ```bash
 grep -i plugin $D/monitord.log          # expect: "Enabling monitord event plugin host",
                                         # "wfmonitor plugin writing events to ...",
-                                        # "started monitord event plugin 'wfmonitor'"
-wc -l $D/monitord-events.jsonl          # ~88 for the diamond example
+                                        # "started monitord event plugin 'wfmonitor'";
+                                        # with condor_poll also "condor polling enabled";
+                                        # NO "tick() raised" tracebacks
+wc -l $D/monitord-events.jsonl          # diamond: ~88 without condor_poll, ~100+ with
+# with condor_poll: the three condor event types are present (counts vary
+# with run timing; expect htcondor_poll >= 2, pool_status >= 1, and
+# htcondor_history >= 1 near completion):
+python3 -c "import json,sys,collections; print(collections.Counter(
+ json.loads(l)['event_type'] for l in open(sys.argv[1])))" $D/monitord-events.jsonl
 tail -2 $D/jobstate.log                 # DAGMAN_FINISHED 0, MONITORD_FINISHED 0
 # every timestamp must be a sane epoch (catches the §6 failure modes):
 python3 -c "import json,sys; bad=[e for e in map(json.loads, open(sys.argv[1]))
@@ -273,6 +321,17 @@ last event time and stamps `jobs_init` with "now" if no wall-clock ts has been
 seen (workflow-monitor `monitord_plugin.py`, `_MIN_EPOCH_TS`). The two
 1970-`@timestamp` `jobs_init` docs from the pre-fix runs were left in
 `monitord-events-*` deliberately, as a record of the failure mode.
+
+**ClassAd `ExprTree` values broke JSON serialization (fixed).** The first
+tick run (`diamond-tick-1`, 2026-06-11) emitted `pool_status` but zero
+`htcondor_poll`/`htcondor_history`: with the htcondor python bindings present
+inside monitord, `query_queue` returns `dict(ad)` ClassAds whose values can
+be `classad.ExprTree` (unevaluated expressions), and the plugin's plain
+`json.dumps` raised `Object of type ExprTree is not JSON serializable` on
+every write — isolated by the plugin host (`tick() raised` in monitord.log),
+so the workflow was unharmed but the events never landed. `EventLogger` had
+always serialized with `default=str`; the plugin's `_write` now does the
+same (workflow-monitor commit `d033d9f`).
 
 **Lost inter-slice route, again.** The first post-retrofit Vector restart
 surfaced `Network is unreachable` on the new sink — both slices had lost

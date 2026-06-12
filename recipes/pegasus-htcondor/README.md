@@ -89,10 +89,12 @@ uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor --in
 
 # Retrofit the pegasus-monitord plugin system + the wfmonitor adapter (see
 # deploy/MONITORD-PLUGIN.md). Run the ES side's --apply-schema FIRST. Then
-# opt in per run with --enable-monitord-plugin:
+# opt in per run with --enable-monitord-plugin — by default the plugin also
+# polls condor from monitord's tick() (--monitord-tick-interval, default 5s;
+# --no-monitord-condor-poll for the pegasus-events-only regression config):
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor --install-monitord-plugin
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor \
-    --run-example --enable-monitord-plugin --run-name diamond-plugin-3
+    --run-example --enable-monitord-plugin --run-name diamond-tick-2
 
 # Infra + routing only (inspect before installing the stack):
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor

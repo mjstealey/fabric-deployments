@@ -60,6 +60,14 @@ it (and expect all-PASS) before provisioning, and after any `config/fabric_rc` e
   run the ES side's `--apply-schema` BEFORE any Vector restart that adds a sink
   for a new family — a sink writing first auto-creates a concrete index on the
   alias name and blocks rollover. Read `deploy/MONITORD-PLUGIN.md` first.
+  With the plugin host's `tick()` (pegasus local commit `2a6a23fca` — NOT in
+  the pinned `MONITORD_PLUGIN_REF` yet; deploy via `--pegasus-src`) and
+  `condor_poll=true` (default with `--enable-monitord-plugin`;
+  `--no-monitord-condor-poll` = regression config), the plugin also polls
+  condor from inside monitord and the stream carries
+  `htcondor_poll`/`htcondor_history`/`pool_status` too. The standalone
+  `--serve` gets `--no-condor-poll` to avoid double-polling in single-path
+  setups.
 - **ES schema changes go through `deploy/elastic-stack/apply_es_schema.sh`**
   (shared by fresh bootstrap and the `--apply-schema` retrofit). One
   `templates/*.json` file per index family — aliases and the `vector_ingest`
