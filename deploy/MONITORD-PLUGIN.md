@@ -19,8 +19,10 @@ on the `pegasus-htcondor` slice; docs in the `elasticsearch-host` slice's
 ### 1a. Pegasus side — the plugin host (branch `monitord-plugin-system`)
 
 Pure-Python addition to `pegasus-monitord`, pinned in this repo at commit
-`2a6a23fca065c5bcadd0fd0273588097d92a04d3` (= branch tip: the entry-point
-system, the cross-thread payload race fix, **and the tick() hook** — see §6).
+`d92bbc6ce70336383890f01375d547bd9853e230` (= branch tip, rebased onto master
+2026-06-12: the entry-point system, the cross-thread payload race fix, **and
+the tick() hook** — see §6). The pre-rebase tip is preserved as tag
+`monitord-plugin-system-pre-rebase` so older SHA pins stay fetchable.
 Three files under `packages/pegasus-python/src/Pegasus/`:
 
 | File | Status | Role |
@@ -42,7 +44,7 @@ Mechanics:
   rather than ever blocking monitord; a wedged plugin is abandoned after
   `…<name>.join_timeout` (default 10s). A crashing plugin never kills monitord.
 - Event payloads are **snapshotted at enqueue** (`dict(kw)`) — the race fix.
-- **`tick()`** (added in `2a6a23fca`): with `…<name>.tick_interval` set to a
+- **`tick()`** (added in `f929618c6`): with `…<name>.tick_interval` set to a
   positive number of seconds, the plugin's *existing* worker thread waits with
   `get(timeout=…)` and calls `plugin.tick()` when the queue is idle (plus a
   starvation guard that ticks between events under continuous flow) — wall
@@ -299,7 +301,7 @@ host enqueued the *live* event dict to plugin worker threads while monitord's
 main thread kept reusing/mutating it (the rc.meta loop overwrites and re-sends
 one dict; `wf.plan` gains `db_url` post-dispatch). Workers observed torn
 payloads. Fixed by snapshotting at enqueue (`dict(kw)`) in pegasus commit
-`c3d6be873`; design notes live in `monitord-plugin-payload-race.md` on the
+`c89a209fc`; design notes live in `monitord-plugin-payload-race.md` on the
 pegasus branch. The node's first overlay (2026-06-09) predated the fix —
 `--install-monitord-plugin` re-overlaying `plugin.py` to the pinned tip was
 the repair.
