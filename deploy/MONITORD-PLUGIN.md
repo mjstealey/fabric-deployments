@@ -188,6 +188,20 @@ embeds the run name). Without the flag, runs behave exactly as before;
 condor polling off — only the four pegasus event types, ~88 events for the
 diamond example).
 
+`--enable-wfevents-plugin` additionally turns on the **standalone `wfevents`
+plugin** ([mjstealey/pegasus-monitord-plugins](https://github.com/mjstealey/pegasus-monitord-plugins),
+a self-contained extraction of the `wfmonitor` adapter) for the same run —
+both plugins run as separate workers inside one monitord, and `wfevents.jsonl`
+appears in the submit dir alongside `monitord-events.jsonl`. Same schema, but
+Vector does **not** tail it; consume it with `workflow-monitor --remote`. Its
+condor polling stays off (wfmonitor already polls). One-time install on the
+submit node:
+
+```bash
+python3 -m pip install --user \
+  'git+https://github.com/mjstealey/pegasus-monitord-plugins.git#subdirectory=plugins/wfevents'
+```
+
 ---
 
 ## 3. Three streams, three index families

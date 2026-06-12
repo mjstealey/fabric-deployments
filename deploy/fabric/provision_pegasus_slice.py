@@ -709,6 +709,7 @@ def _plan_and_monitor(
     enable_plugin=False,
     tick_interval=5.0,
     condor_poll=True,
+    enable_wfevents=False,
 ):
     """Plan+submit wf_file from workdir into runs/submit/<run_name>, then monitor.
 
@@ -726,6 +727,12 @@ def _plan_and_monitor(
     plugin also polls condor_q/history/status from monitord's tick() at
     tick_interval seconds; --no-monitord-condor-poll is the regression
     configuration (plugin on, polling off, pre-tick behavior).
+
+    With enable_wfevents, the run additionally turns on the standalone wfevents
+    plugin (mjstealey/pegasus-monitord-plugins, installed separately with pip
+    --user), which writes wfevents.jsonl into the submit dir — same schema,
+    consumable by workflow-monitor --remote/--replay. Vector does NOT tail it.
+    Its condor polling stays off so two plugins never poll the same schedd.
     """
     sub_dir = f"{runs}/submit/{run_name}"
     # Force the pool's data config unless the workflow already chose one. Workers
@@ -736,19 +743,26 @@ def _plan_and_monitor(
         "grep -q '^pegasus.data.configuration' pegasus.properties || "
         f"printf 'pegasus.data.configuration=%s\\n' {data_conf} >> pegasus.properties"
     )
-    if enable_plugin:
+    if enable_plugin or enable_wfevents:
         # events_path embeds the run name, and pegasus.properties persists in
         # the workdir across runs: drop any stale plugin block, then append the
         # current one. (Properties must be in place before pegasus-plan bakes
         # them into the submit dir's run properties for monitord.)
-        plugin_props = [
-            "pegasus.monitord.plugins.wfmonitor.enabled=true",
-            f"pegasus.monitord.plugins.wfmonitor.events_path={sub_dir}/monitord-events.jsonl",
-        ]
-        if condor_poll:
+        plugin_props = []
+        if enable_plugin:
             plugin_props += [
-                f"pegasus.monitord.plugins.wfmonitor.tick_interval={tick_interval:g}",
-                "pegasus.monitord.plugins.wfmonitor.condor_poll=true",
+                "pegasus.monitord.plugins.wfmonitor.enabled=true",
+                f"pegasus.monitord.plugins.wfmonitor.events_path={sub_dir}/monitord-events.jsonl",
+            ]
+            if condor_poll:
+                plugin_props += [
+                    f"pegasus.monitord.plugins.wfmonitor.tick_interval={tick_interval:g}",
+                    "pegasus.monitord.plugins.wfmonitor.condor_poll=true",
+                ]
+        if enable_wfevents:
+            plugin_props += [
+                "pegasus.monitord.plugins.wfevents.enabled=true",
+                f"pegasus.monitord.plugins.wfevents.events_path={sub_dir}/wfevents.jsonl",
             ]
         block = "\\n".join(plugin_props) + "\\n"
         submit.execute(
@@ -815,6 +829,7 @@ def run_example(slice_obj, args):
         enable_plugin=args.enable_monitord_plugin,
         tick_interval=args.monitord_tick_interval,
         condor_poll=args.monitord_condor_poll,
+        enable_wfevents=args.enable_wfevents_plugin,
     )
     print(_watch_hint(sub_dir))
 
@@ -873,6 +888,7 @@ def run_workflow(slice_obj, args):
         enable_plugin=args.enable_monitord_plugin,
         tick_interval=args.monitord_tick_interval,
         condor_poll=args.monitord_condor_poll,
+        enable_wfevents=args.enable_wfevents_plugin,
     )
     print(_watch_hint(sub_dir))
 
@@ -1096,6 +1112,16 @@ def parse_args(argv=None):
         metavar="SECONDS",
         help="with --enable-monitord-plugin: the plugin host's tick cadence "
         "(drives the in-plugin condor polling; history/pool sub-throttle off it)",
+    )
+    p.add_argument(
+        "--enable-wfevents-plugin",
+        action="store_true",
+        help="with --run-example/--run-workflow: also enable the standalone "
+        "wfevents monitord plugin so the run writes wfevents.jsonl into the "
+        "submit dir (same schema; consume with workflow-monitor --remote — "
+        "Vector does not tail it). Install it once on the submit node: "
+        "python3 -m pip install --user 'git+https://github.com/mjstealey/"
+        "pegasus-monitord-plugins.git#subdirectory=plugins/wfevents'",
     )
     p.add_argument(
         "--monitord-condor-poll",
