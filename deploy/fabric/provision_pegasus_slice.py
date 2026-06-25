@@ -113,8 +113,10 @@ CONDOR_FILES = [
 # The pegasus-monitord entry-point plugin system is pure Python: these three
 # files overlaid onto the apt-installed tree ARE the install. Pinned to the
 # tip of pegasus-isi/pegasus branch monitord-plugin-system (entry-point
-# system + cross-thread payload race fix + the tick() hook).
-MONITORD_PLUGIN_REF = "ca2e6384f3b0248b840d2355274d8b77d006b886"
+# system + cross-thread payload race fix + the tick() hook + plugin-host
+# edge-case hardening: reserved synthetic endpoint name, multiplex-aware
+# replay/recovery DB-purge guard, worker-lifecycle cleanup).
+MONITORD_PLUGIN_REF = "fba2030e6a35e36817ca673cc1689f0e154486f2"
 MONITORD_PLUGIN_FILES = [  # repo-relative under packages/pegasus-python/src/Pegasus/
     "monitoring/plugin.py",
     "monitoring/event_output.py",
