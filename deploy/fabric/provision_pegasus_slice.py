@@ -713,6 +713,7 @@ def _plan_and_monitor(
     condor_poll=True,
     enable_wfevents=False,
     wfevents_condor_poll=False,
+    wfevents_join_timeout=60.0,
     serve=True,
 ):
     """Plan+submit wf_file from workdir into runs/submit/<run_name>, then monitor.
@@ -737,7 +738,11 @@ def _plan_and_monitor(
     --user), which writes wfevents.jsonl into the submit dir — same schema,
     consumable by workflow-monitor --remote/--replay. Vector does NOT tail it.
     wfevents_condor_poll gives the condor polling to wfevents instead (same
-    tick_interval cadence) — enable it on ONE plugin only.
+    tick_interval cadence) — enable it on ONE plugin only. Polling makes the
+    plugin's final condor flush the slow step at stop(), so the run also gets
+    pegasus.monitord.plugins.wfevents.join_timeout=wfevents_join_timeout:
+    the host's default stop() budget (10s) is below the worst-case flush
+    (~42s), and wfevents >=0.3.0 skips the final polls that do not fit it.
 
     serve=False skips the headless workflow-monitor --serve daemon entirely:
     no workflow-events.jsonl is written, so nothing from the run reaches ES
@@ -784,6 +789,7 @@ def _plan_and_monitor(
                 plugin_props += [
                     f"pegasus.monitord.plugins.wfevents.tick_interval={tick_interval:g}",
                     "pegasus.monitord.plugins.wfevents.condor_poll=true",
+                    f"pegasus.monitord.plugins.wfevents.join_timeout={wfevents_join_timeout:g}",
                 ]
         block = "\\n".join(plugin_props) + "\\n"
         submit.execute(
@@ -864,6 +870,7 @@ def run_example(slice_obj, args):
         condor_poll=args.monitord_condor_poll,
         enable_wfevents=args.enable_wfevents_plugin,
         wfevents_condor_poll=args.wfevents_condor_poll,
+        wfevents_join_timeout=args.wfevents_join_timeout,
         serve=args.serve_monitor,
     )
     print(_watch_hint(sub_dir))
@@ -925,6 +932,7 @@ def run_workflow(slice_obj, args):
         condor_poll=args.monitord_condor_poll,
         enable_wfevents=args.enable_wfevents_plugin,
         wfevents_condor_poll=args.wfevents_condor_poll,
+        wfevents_join_timeout=args.wfevents_join_timeout,
         serve=args.serve_monitor,
     )
     print(_watch_hint(sub_dir))
@@ -1167,6 +1175,17 @@ def parse_args(argv=None):
         "condor_q/history/status from its tick() (cadence from "
         "--monitord-tick-interval). Enable polling on ONE plugin only — "
         "combine with --no-monitord-condor-poll if wfmonitor is also enabled.",
+    )
+    p.add_argument(
+        "--wfevents-join-timeout",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="with --wfevents-condor-poll: the run's "
+        "pegasus.monitord.plugins.wfevents.join_timeout — the stop() budget "
+        "the plugin host grants wfevents. 60 covers the worst-case final "
+        "condor flush (~42s); at the host default (10) wfevents >=0.3.0 "
+        "skips the final polls that do not fit the budget.",
     )
     p.add_argument(
         "--serve-monitor",

@@ -195,8 +195,14 @@ a self-contained extraction of the `wfmonitor` adapter) for the same run —
 both plugins run as separate workers inside one monitord, and `wfevents.jsonl`
 appears in the submit dir alongside `monitord-events.jsonl`. Same schema, but
 Vector does **not** tail it; consume it with `workflow-monitor --remote`. Its
-condor polling stays off (wfmonitor already polls). One-time install on the
-submit node:
+condor polling stays off (wfmonitor already polls). When `--wfevents-condor-poll`
+gives it the polling, the run also writes
+`pegasus.monitord.plugins.wfevents.join_timeout` (`--wfevents-join-timeout`,
+default 60): wfevents ≥ 0.3.0 budget-checks its final condor flush against the
+host's stop() budget, and at the host default (10s, below the ~42s worst case)
+it skips the final queue/history/pool polls that don't fit — warning at start
+and stop — while still writing the terminal `workflow_end`. One-time install
+on the submit node:
 
 ```bash
 python3 -m pip install --user \
