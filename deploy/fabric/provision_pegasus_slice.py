@@ -116,7 +116,7 @@ CONDOR_FILES = [
 # system + cross-thread payload race fix + the tick() hook + plugin-host
 # edge-case hardening: reserved synthetic endpoint name, multiplex-aware
 # replay/recovery DB-purge guard, worker-lifecycle cleanup).
-MONITORD_PLUGIN_REF = "fba2030e6a35e36817ca673cc1689f0e154486f2"
+MONITORD_PLUGIN_REF = "e7da14941d26708237ad3bc65ccd07e05d7dace5"
 MONITORD_PLUGIN_FILES = [  # repo-relative under packages/pegasus-python/src/Pegasus/
     "monitoring/plugin.py",
     "monitoring/event_output.py",
