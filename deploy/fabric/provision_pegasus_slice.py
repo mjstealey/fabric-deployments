@@ -115,8 +115,10 @@ CONDOR_FILES = [
 # tip of pegasus-isi/pegasus branch monitord-plugin-system (entry-point
 # system + cross-thread payload race fix + the tick() hook + plugin-host
 # edge-case hardening: reserved synthetic endpoint name, multiplex-aware
-# replay/recovery DB-purge guard, worker-lifecycle cleanup).
-MONITORD_PLUGIN_REF = "e7da14941d26708237ad3bc65ccd07e05d7dace5"
+# replay/recovery DB-purge guard, worker-lifecycle cleanup). Current pin is
+# the 2026-07-19 merge of main; the three overlay files are byte-identical
+# to the previous pin e7da14941.
+MONITORD_PLUGIN_REF = "317a020a35940511c51e422c8c7f7f4c6b09ceaf"
 MONITORD_PLUGIN_FILES = [  # repo-relative under packages/pegasus-python/src/Pegasus/
     "monitoring/plugin.py",
     "monitoring/event_output.py",
