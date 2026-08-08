@@ -133,6 +133,16 @@ MONITORD_ADAPTER_SPEC = (
 MONITORD_MANIFEST = (
     "/usr/lib/pegasus/python/Pegasus/monitoring/.monitord-plugin-manifest.json"
 )
+# The standalone wfevents plugin (separate repo, own release cadence). It rides
+# the SAME plugin host as wfmonitor, so the 3-file overlay must already be in
+# place -- but it needs no Vector change, because Vector does not tail
+# wfevents.jsonl (consume it with workflow-monitor --remote/--replay).
+WFEVENTS_PLUGIN_SPEC = (
+    "git+https://github.com/mjstealey/pegasus-monitord-plugins.git"
+    "#subdirectory=plugins/wfevents"
+)
+# pip distribution name (NOT "wfevents" -- the import package is monitord_wfevents).
+WFEVENTS_DIST = "pegasus-monitord-plugin-wfevents"
 
 
 def _load_fablib():
@@ -358,6 +368,8 @@ def _bootstrap_node(node, role, node_ip, submit_ip, fabnet_cidr, pw, args):
         f"PEGASUS_VERSION={args.pegasus_version} "
         f"PEG_DIR=$HOME/{REMOTE_DIR}"
     )
+    if args.htcondor_version:
+        env += f" HTCONDOR_VERSION={args.htcondor_version}"
     if role == "cm":
         env += (
             f" RUNS_DIR={args.runs_dir}"
@@ -642,6 +654,90 @@ def install_monitord_plugin(slice_obj, args):
     print(
         "  done. Enable per-run with --run-example/--run-workflow "
         "--enable-monitord-plugin."
+    )
+
+
+def install_wfevents_plugin(slice_obj, args):
+    """Retrofit the standalone wfevents monitord plugin onto the submit node.
+
+    Unlike --install-monitord-plugin this touches neither the pegasus tree nor
+    Vector: wfevents is an ordinary pip package that registers itself in the
+    pegasus.monitord.plugins entry-point group, and Vector does not tail the
+    wfevents.jsonl it writes. It does ride the same plugin host, so the 3-file
+    overlay (--install-monitord-plugin) must already be on the node -- without
+    it pegasus-monitord has no plugin system to discover the entry point.
+
+    Idempotent; opt in per run with --enable-wfevents-plugin.
+    """
+    submit = slice_obj.get_node(args.submit_node)
+    print(f"==> installing the wfevents monitord plugin on '{args.submit_node}'")
+
+    # The plugin host is what discovers entry points -- warn loudly if absent
+    # rather than leaving a silently inert plugin behind.
+    out, _ = submit.execute(
+        f"test -f {MONITORD_MANIFEST} && echo OVERLAY_PRESENT || echo OVERLAY_ABSENT",
+        quiet=True,
+    )
+    if "OVERLAY_PRESENT" not in (out or ""):
+        print(
+            "  ! no monitord plugin overlay manifest on this node — wfevents "
+            "will install but pegasus-monitord has no plugin host to load it.\n"
+            "    Run --install-monitord-plugin first."
+        )
+
+    spec = args.wfevents_plugin_spec
+    print(f"==> pip installing wfevents ({spec})")
+    # Two passes for the same reason as the adapter: the version number does not
+    # move between commits, so only --force-reinstall guarantees the requested ref.
+    out, err = submit.execute(
+        'export PATH="$HOME/.local/bin:$PATH"; '
+        f'python3 -m pip install --user --quiet "{spec}" && '
+        f'python3 -m pip install --user --quiet --force-reinstall --no-deps "{spec}" '
+        "&& echo PIP_OK"
+    )
+    if "PIP_OK" not in (out or ""):
+        print(out)
+        if err and err.strip():
+            print("  [pip stderr]\n" + err)
+        sys.exit("error: wfevents plugin install failed")
+
+    # Entry-point check with the interpreter monitord's wrapper resolves.
+    out, _ = submit.execute(
+        'python3 -c "from importlib.metadata import entry_points; '
+        "eps = {e.name: e for e in entry_points(group='pegasus.monitord.plugins')}; "
+        "assert 'wfevents' in eps, sorted(eps); eps['wfevents'].load(); "
+        "print('WFEVENTS_OK')\""
+    )
+    if "WFEVENTS_OK" not in (out or ""):
+        print(out)
+        sys.exit(
+            "error: wfevents entry point not loadable by /usr/bin/python3 -- "
+            "pegasus-monitord would run without the plugin"
+        )
+    print("  wfevents entry point loads (pegasus.monitord.plugins)")
+
+    # Record provenance next to the adapter's, when the overlay manifest exists.
+    ver_q = (
+        "import importlib.metadata as m, json; "
+        f"d = m.distribution('{WFEVENTS_DIST}'); "
+        "raw = d.read_text('direct_url.json'); "
+        "u = json.loads(raw) if raw else {}; "
+        "print(d.version, u.get('vcs_info', {}).get('commit_id') or u.get('url') or 'unknown')"
+    )
+    resolved, _ = submit.execute(f'python3 -c "{ver_q}"', quiet=True)
+    resolved = (resolved or "unknown unknown").strip().splitlines()[-1]
+    version, _, commit = resolved.partition(" ")
+    submit.execute(
+        f'test -f {MONITORD_MANIFEST} && sudo python3 -c "import json; '
+        f"p = '{MONITORD_MANIFEST}'; m = json.load(open(p)); "
+        f"m['wfevents_spec'] = '{spec}'; m['wfevents_version'] = '{version}'; "
+        f"m['wfevents_resolved'] = '{commit}'; "
+        "json.dump(m, open(p, 'w'), indent=2)\" || true"
+    )
+    print(f"  wfevents resolved: {version} @ {commit}")
+    print(
+        "  done. Enable per-run with --run-example/--run-workflow "
+        "--enable-wfevents-plugin (Vector does NOT ship this stream)."
     )
 
 
@@ -1036,6 +1132,12 @@ def parse_args(argv=None):
         help="shared HTCondor pool signing key (default: generated + saved, gitignored)",
     )
     p.add_argument(
+        "--htcondor-version",
+        default=None,
+        help="exact HTCondor apt version to pin, e.g. 25.12.2 (repo channel derived "
+        "from the major: 25.12.2 -> 25.x); default: latest in the 24.x channel",
+    )
+    p.add_argument(
         "--pegasus-version", default="5.1.2", help="Pegasus apt version (best-effort)"
     )
     p.add_argument(
@@ -1124,6 +1226,19 @@ def parse_args(argv=None):
         "monitord-events stream (run elastic-stack --apply-schema FIRST)",
     )
     p.add_argument(
+        "--install-wfevents-plugin",
+        action="store_true",
+        help="install the standalone wfevents monitord plugin (pip, submit node "
+        "only; needs the --install-monitord-plugin overlay for its plugin host, "
+        "but touches neither pegasus nor Vector). Opt in per run with "
+        "--enable-wfevents-plugin",
+    )
+    p.add_argument(
+        "--wfevents-plugin-spec",
+        default=WFEVENTS_PLUGIN_SPEC,
+        help="pip spec for the wfevents plugin (pin a ref with ...git@<sha>#subdirectory=...)",
+    )
+    p.add_argument(
         "--pegasus-plugin-ref",
         default=MONITORD_PLUGIN_REF,
         help="pegasus-isi/pegasus commit SHA the 3 monitord plugin files are "
@@ -1166,9 +1281,8 @@ def parse_args(argv=None):
         help="with --run-example/--run-workflow: also enable the standalone "
         "wfevents monitord plugin so the run writes wfevents.jsonl into the "
         "submit dir (same schema; consume with workflow-monitor --remote — "
-        "Vector does not tail it). Install it once on the submit node: "
-        "python3 -m pip install --user 'git+https://github.com/mjstealey/"
-        "pegasus-monitord-plugins.git#subdirectory=plugins/wfevents'",
+        "Vector does not tail it). Install it once with "
+        "--install-wfevents-plugin",
     )
     p.add_argument(
         "--wfevents-condor-poll",
@@ -1237,12 +1351,15 @@ def main(argv=None):
         or args.run_workflow
         or args.install_apptainer
         or args.install_monitord_plugin
+        or args.install_wfevents_plugin
     ):
         slice_obj = fablib.get_slice(args.name)
         if args.install_apptainer:
             install_apptainer(slice_obj, args)
         if args.install_monitord_plugin:
             install_monitord_plugin(slice_obj, args)
+        if args.install_wfevents_plugin:
+            install_wfevents_plugin(slice_obj, args)
         if args.wire_es:
             wire_es(slice_obj, args)
         if args.run_example:

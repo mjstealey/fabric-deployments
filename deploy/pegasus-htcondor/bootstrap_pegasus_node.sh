@@ -19,6 +19,9 @@
 #   NODE_IP                this node's own FABNet IP (daemon bind addr) REQUIRED
 #   FABNET_CIDR            pool subnet for host authorization          (CONDOR_HOST/24)
 #   POOL_PASSWORD          shared pool signing key                     REQUIRED
+#   HTCONDOR_VERSION       exact HTCondor apt version, e.g. 25.12.2    (channel latest)
+#   HTCONDOR_CHANNEL       wisc repo channel                           (<major>.x of
+#                          HTCONDOR_VERSION, else 24.x)
 #   PEGASUS_VERSION        Pegasus apt version (best-effort)           (5.1.2)
 #   INSTALL_APPTAINER      install Apptainer container runtime         (1; 0 to skip)
 #   PEG_DIR                uploaded asset dir                          ($HOME/pegasus-htcondor)
@@ -33,6 +36,12 @@ CONDOR_HOST="${CONDOR_HOST:?set CONDOR_HOST to the submit/CM FABNet IP}"
 NODE_IP="${NODE_IP:?set NODE_IP to this node FABNet IP}"
 FABNET_CIDR="${FABNET_CIDR:-${CONDOR_HOST%.*}.0/24}"
 POOL_PASSWORD="${POOL_PASSWORD:?set POOL_PASSWORD to the shared pool signing key}"
+HTCONDOR_VERSION="${HTCONDOR_VERSION:-}"
+if [ -n "${HTCONDOR_VERSION}" ]; then
+  HTCONDOR_CHANNEL="${HTCONDOR_CHANNEL:-${HTCONDOR_VERSION%%.*}.x}"
+else
+  HTCONDOR_CHANNEL="${HTCONDOR_CHANNEL:-24.x}"
+fi
 PEGASUS_VERSION="${PEGASUS_VERSION:-5.1.2}"
 PEG_DIR="${PEG_DIR:-$HOME/pegasus-htcondor}"
 RUNS_DIR="${RUNS_DIR:-/opt/workflows}"
@@ -46,8 +55,12 @@ INSTALL_VECTOR="${INSTALL_VECTOR:-}"
 INSTALL_APPTAINER="${INSTALL_APPTAINER:-1}"
 # Vector apt setup script (Datadog-era; the old repositories.timber.io host is
 # dead). Fallback: the GitHub release .deb if the repo is unreachable.
+# VECTOR_VERSION is PINNED: 0.57.0 stopped interpolating ${VAR} env references
+# in TOML configs, so auth.password = "${ELASTIC_INGEST_PASSWORD}" reaches ES
+# verbatim and every sink healthcheck 401s. 0.56.0 is the last known-good.
+VECTOR_VERSION="${VECTOR_VERSION:-0.56.0}"
 VECTOR_SETUP_URL="${VECTOR_SETUP_URL:-https://setup.vector.dev}"
-VECTOR_DEB_URL="${VECTOR_DEB_URL:-https://github.com/vectordotdev/vector/releases/download/v0.56.0/vector_0.56.0-1_amd64.deb}"
+VECTOR_DEB_URL="${VECTOR_DEB_URL:-https://github.com/vectordotdev/vector/releases/download/v${VECTOR_VERSION}/vector_${VECTOR_VERSION}-1_amd64.deb}"
 
 log() { printf '\n=== %s ===\n' "$*"; }
 export DEBIAN_FRONTEND=noninteractive
@@ -60,13 +73,45 @@ CODENAME="$(lsb_release -cs)"   # 'jammy' on default_ubuntu_22
 
 # --- 2. HTCondor -----------------------------------------------------------
 if ! command -v condor_version >/dev/null 2>&1; then
-  log "installing HTCondor (research.cs.wisc.edu repo, 24.x)"
-  curl -fsSL "https://research.cs.wisc.edu/htcondor/repo/keys/HTCondor-24.x-Key" \
-    | sudo gpg --dearmor -o /usr/share/keyrings/htcondor.gpg
-  echo "deb [signed-by=/usr/share/keyrings/htcondor.gpg] https://research.cs.wisc.edu/htcondor/repo/ubuntu/24.x ${CODENAME} main" \
+  log "installing HTCondor (research.cs.wisc.edu repo, ${HTCONDOR_CHANNEL}${HTCONDOR_VERSION:+, pinned ${HTCONDOR_VERSION}})"
+  # research.cs.wisc.edu (and its htcss-downloads.chtc.wisc.edu redirect target)
+  # serves a misordered TLS chain that OpenSSL tolerates but apt's GnuTLS
+  # rejects ("certificate issuer is unknown"). Anchor the InCommon intermediate
+  # the server itself presents so apt can verify the leaf directly; if wisc
+  # fixes the chain the extraction finds nothing and apt works regardless.
+  if [ ! -f /usr/local/share/ca-certificates/incommon-rsa-server-ca-2.crt ]; then
+    echo | openssl s_client -connect research.cs.wisc.edu:443 \
+        -servername research.cs.wisc.edu -showcerts 2>/dev/null \
+      | awk '/BEGIN CERTIFICATE/{n++} n>0{print > ("/tmp/htcondor-chain" n ".pem")}'
+    for f in /tmp/htcondor-chain*.pem; do
+      [ -f "$f" ] || continue
+      if openssl x509 -in "$f" -noout -subject 2>/dev/null | grep -q "InCommon RSA Server CA 2"; then
+        sudo cp "$f" /usr/local/share/ca-certificates/incommon-rsa-server-ca-2.crt
+        sudo update-ca-certificates >/dev/null
+        break
+      fi
+    done
+    rm -f /tmp/htcondor-chain*.pem
+  fi
+  curl -fsSL "https://research.cs.wisc.edu/htcondor/repo/keys/HTCondor-${HTCONDOR_CHANNEL}-Key" \
+    | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/htcondor.gpg
+  echo "deb [signed-by=/usr/share/keyrings/htcondor.gpg] https://research.cs.wisc.edu/htcondor/repo/ubuntu/${HTCONDOR_CHANNEL} ${CODENAME} main" \
     | sudo tee /etc/apt/sources.list.d/htcondor.list >/dev/null
   sudo apt-get update -y
-  sudo apt-get install -y condor
+  if [ -n "${HTCONDOR_VERSION}" ]; then
+    # Resolve the full apt version string (e.g. 25.12.2 -> 25.12.2-1+ubu22); a
+    # pin that is not in the channel must fail loudly, not fall back silently.
+    # awk must read ALL input (no early exit): under pipefail an early exit
+    # SIGPIPEs apt-cache and set -e kills the script with no message.
+    CONDOR_APT_VER="$(apt-cache madison condor \
+      | awk -v v="${HTCONDOR_VERSION}-" 'ver == "" && index($3, v) == 1 {ver=$3} END{print ver}')"
+    [ -n "${CONDOR_APT_VER}" ] \
+      || { echo "  ! condor ${HTCONDOR_VERSION} not found in the ${HTCONDOR_CHANNEL} repo"; exit 1; }
+    echo "  resolved condor apt version: ${CONDOR_APT_VER}"
+    sudo apt-get install -y "condor=${CONDOR_APT_VER}"
+  else
+    sudo apt-get install -y condor
+  fi
 fi
 
 # --- 3. condor config drop-ins + shared pool signing key -------------------
@@ -103,7 +148,7 @@ sudo systemctl restart condor
 if ! command -v pegasus-version >/dev/null 2>&1; then
   log "installing Pegasus ${PEGASUS_VERSION} (download.pegasus.isi.edu repo)"
   curl -fsSL https://download.pegasus.isi.edu/pegasus/gpg.txt \
-    | sudo gpg --dearmor -o /usr/share/keyrings/pegasus.gpg
+    | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/pegasus.gpg
   echo "deb [signed-by=/usr/share/keyrings/pegasus.gpg] https://download.pegasus.isi.edu/pegasus/ubuntu ${CODENAME} main" \
     | sudo tee /etc/apt/sources.list.d/pegasus.list >/dev/null
   sudo apt-get update -y
@@ -164,14 +209,15 @@ if [ -n "${INSTALL_VECTOR}" ]; then
     # packaging hiccups; Vector can be (re)wired later with --wire-es. Using `if`
     # keeps these failures from tripping `set -e`.
     if curl -1sLf "${VECTOR_SETUP_URL}" | sudo -E bash; then
-      sudo apt-get install -y vector || true
+      sudo apt-get install -y "vector=${VECTOR_VERSION}-1" || true
     fi
     if ! command -v vector >/dev/null 2>&1; then
-      log "apt repo unavailable; falling back to Vector release .deb"
+      log "apt repo unavailable (or lacks ${VECTOR_VERSION}); falling back to Vector release .deb"
       if curl -1sLfo /tmp/vector.deb "${VECTOR_DEB_URL}"; then
         sudo apt-get install -y /tmp/vector.deb || sudo dpkg -i /tmp/vector.deb || true
       fi
     fi
+    sudo apt-mark hold vector >/dev/null 2>&1 || true
   fi
   if command -v vector >/dev/null 2>&1; then
     log "rendering Vector config (sink https://${ES_HOST}:9200, tailing ${RUNS_DIR})"

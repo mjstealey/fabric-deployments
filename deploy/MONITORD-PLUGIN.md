@@ -208,6 +208,18 @@ and stop — while still writing the terminal `workflow_end`. One-time install
 on the submit node:
 
 ```bash
+uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor \
+    --install-wfevents-plugin        # --wfevents-plugin-spec pins a ref
+```
+
+It rides the same plugin host as `wfmonitor`, so run `--install-monitord-plugin`
+first (the flag warns if the overlay manifest is missing); it needs no Vector
+change, because Vector does not tail `wfevents.jsonl`. The install verifies the
+entry point loads under `/usr/bin/python3` and records
+`wfevents_spec`/`wfevents_version`/`wfevents_resolved` in the overlay manifest.
+Equivalent by hand:
+
+```bash
 python3 -m pip install --user \
   'git+https://github.com/mjstealey/pegasus-monitord-plugins.git#subdirectory=plugins/wfevents'
 ```
