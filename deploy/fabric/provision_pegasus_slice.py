@@ -116,9 +116,11 @@ CONDOR_FILES = [
 # system + cross-thread payload race fix + the tick() hook + plugin-host
 # edge-case hardening: reserved synthetic endpoint name, multiplex-aware
 # replay/recovery DB-purge guard, worker-lifecycle cleanup). Current pin is
-# the 2026-07-19 merge of main; the three overlay files are byte-identical
-# to the previous pin e7da14941.
-MONITORD_PLUGIN_REF = "317a020a35940511c51e422c8c7f7f4c6b09ceaf"
+# the 2026-08-04 merge of main -- the ref the live slices actually carry; the
+# three overlay files are byte-identical to the previous pins 317a020a3 and
+# e7da14941 (the 50-commit delta from 317a020a3 is main-side only: monitoring/
+# workflow.py, docs, java -- it never touches the overlay surface).
+MONITORD_PLUGIN_REF = "da1db847c685cb6c1f34d7c8de8c7af26f5c1997"
 MONITORD_PLUGIN_FILES = [  # repo-relative under packages/pegasus-python/src/Pegasus/
     "monitoring/plugin.py",
     "monitoring/event_output.py",

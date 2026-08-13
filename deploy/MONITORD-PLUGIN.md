@@ -19,12 +19,14 @@ on the `pegasus-htcondor` slice; docs in the `elasticsearch-host` slice's
 ### 1a. Pegasus side — the plugin host (branch `monitord-plugin-system`)
 
 Pure-Python addition to `pegasus-monitord`, pinned in this repo at commit
-`317a020a35940511c51e422c8c7f7f4c6b09ceaf` (= branch tip 2026-07-19, the merge
-of `main` after the master→main rename: the entry-point system, the
+`da1db847c685cb6c1f34d7c8de8c7af26f5c1997` (= branch tip 2026-08-04, a merge
+of `main`: the entry-point system, the
 cross-thread payload race fix, **the tick() hook** (see §6), the edge-case +
 deep-snapshot/bounded-start()/stop() hardening, and per-plugin event filtering
 / overflow policy / the restart flag; the three overlay files are byte-identical
-to the previous pin `e7da14941`). Each
+to the previous pins `317a020a3` and `e7da14941` — every bump since `e7da14941`
+has been main-side churn outside the overlay surface, so the pin moves without
+changing a byte of what lands on the node). Each
 pre-rebase tip is preserved as a tag (`monitord-plugin-system-pre-rebase`,
 `…-pre-rebase-2`) so older SHA pins stay fetchable.
 Three files under `packages/pegasus-python/src/Pegasus/`:
