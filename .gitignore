@@ -39,6 +39,9 @@ deploy/vector/data/
 deploy/pegasus-htcondor/.pool-password
 deploy/pegasus-htcondor/vendor/
 
+# ── Generated run reports / scratch output (per-deploy, not source) ──────────
+outputs/
+
 # ── Defensive: stray key / cert material anywhere ────────────────────────────
 *.key
 *.pem
