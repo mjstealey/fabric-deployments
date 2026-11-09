@@ -107,10 +107,16 @@ Properties (read from the run's `pegasus.properties`, prefix
 
 ## 2. How it is deployed (this repo is the source of truth)
 
-The plugin host is **not** in any Pegasus release; the apt-installed
-Pegasus 5.1.2 is retrofitted by overlaying the three files. Because the change
-is pure Python, the overlay *is* the install — no rebuild, and the entry point
-needs no registration on the Pegasus side.
+The plugin host is **not** in any Pegasus 5.x release; an apt-installed 5.x
+tree is retrofitted by overlaying the three files. Because the change is pure
+Python, the overlay *is* the install — no rebuild, and the entry point needs no
+registration on the Pegasus side. **Pegasus ≥ 6.0 ships the plugin host
+natively** (the `monitord-plugin-system` branch merged for 6.0, and the
+`development/6.0` debs the pool now installs carry it):
+`--install-monitord-plugin` detects that (`Pegasus/monitoring/plugin.py`
+present, no overlay manifest), skips step 1 below, and still performs the
+adapter install, entry-point verification, `~/.pegasusrc` enablement, and the
+Vector stream.
 
 One command does the whole producer-side retrofit (idempotent):
 

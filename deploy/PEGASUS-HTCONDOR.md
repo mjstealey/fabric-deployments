@@ -110,7 +110,19 @@ ELASTIC_INGEST_PASSWORD=… uv run python recipes/pegasus-htcondor/provision.py 
 # 4. Smoke-test end to end.
 uv run python recipes/pegasus-htcondor/provision.py \
     --name pegasus-htcondor --run-example
+
+# 5. (optional) The PegasusAI Studio webapp on the submit node — see the
+#    "PegasusAI Studio webapp" section below.
+uv run python recipes/pegasus-htcondor/provision.py \
+    --name pegasus-htcondor --install-studio
 ```
+
+The nodes run **Ubuntu 24 (noble)** and Pegasus from the **development/6.0 apt
+channel, unpinned** — the same channel the studio container image bundles, so
+host and container Pegasus stay in step (see the studio section for why skew is
+fatal). `--pegasus-channel release --pegasus-version 5.1.2` restores the old
+stable-channel behavior (on an Ubuntu 22 `--image`; the 6.0 dev debs need
+noble's libc).
 
 What step 1 (`--bootstrap`) does, per node, in order:
 
@@ -181,6 +193,55 @@ What it relies on, and the knobs:
 
 ---
 
+## PegasusAI Studio webapp (container on the submit node)
+
+`--install-studio` runs `ghcr.io/pegasus-isi/studio-webapp:main` on the submit
+node. The container **plans with its own bundled Pegasus but submits through
+the host schedd** (`--network host` + `_CONDOR_*` env), and DAGMan + all jobs
+run under the **host** Pegasus — which is why the pool tracks the same
+`development/6.0` apt channel the image bundles. Version skew is fatal, not
+cosmetic: a 5.1.2 host `pegasus-exitcode` exits 2 on the 6.0 planner's `-R`/`-M`
+POST-script flags, aborting every DAG on its first node.
+
+```bash
+uv run python recipes/pegasus-htcondor/provision.py --install-studio
+# then, from your machine:
+ssh -F ~/.ssh/fabric-submit.conf -L 8888:localhost:8888 fabric-submit
+open http://localhost:8888
+```
+
+What the installer sets up (every piece is required):
+
+- **docker** (`docker.io` apt package) and the image.
+- **passwd/group shims** — `~/.studio/container-passwd` / `container-group` are
+  the image's own `/etc/passwd` + `/etc/group` with
+  `ubuntu:x:1000:1000::/home/ubuntu:/bin/bash` / `ubuntu:x:1000:` appended,
+  bind-mounted read-only. Without them uid 1000 resolves to `?` inside the
+  container and Pegasus plans into a literal `?/` submit dir.
+- **IDTOKEN auth** — the container can present neither FS identity (does not
+  cross the container boundary) nor the root-only pool key, so
+  `00-pool-common.conf` lists `IDTOKENS` and the installer mints
+  `sudo condor_token_create -identity ubuntu@$(condor_config_val TRUST_DOMAIN)`
+  into `~/.condor/tokens.d/studio` (0600), pointed at by
+  `_CONDOR_SEC_TOKEN_DIRECTORY`.
+- **`_CONDOR_CONDOR_HOST`** = the submit node's FABNet IP;
+  **`_CONDOR_SCHEDD_HOST`** = the condor `TRUST_DOMAIN` (the node's OpenStack
+  hostname). The container never resolves that name — the collector lookup
+  returns the schedd's address.
+- **`/home/ubuntu` bind-mounted**, `HOME=/home/ubuntu`, so plans/submit dirs
+  land on the host filesystem where the host schedd (and Vector) can see them.
+- The monitord plugin install (`--install-monitord-plugin`) writes
+  `pegasus.monitord.plugins.wfmonitor.enabled = true` into `~/.pegasusrc` —
+  monitord folds only `~/.pegasusrc` into the plan-time properties snapshot, so
+  that line is what turns the wfmonitor stream on for studio-planned runs.
+
+Quick health checks: `docker exec studio whoami` → `ubuntu`, and
+`docker exec studio condor_q` authenticates (no `AUTHENTICATE:1003`). The
+studio's own state (`~/.studio/studio.db`, projects under `~/work/workflows`)
+lives on the host and survives container recreation.
+
+---
+
 ## Testing the monitord plugin path
 
 The pool can also exercise the **pegasus-monitord entry-point plugin system**
@@ -194,7 +255,9 @@ verification runbook: [`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md).
 # Receiver first (adds the monitord-events-* template/alias/role, idempotent):
 uv run python recipes/elastic-stack/provision.py --apply-schema
 
-# Retrofit the submit node (3-file overlay + adapter + Vector stream), once:
+# Install on the submit node (adapter + ~/.pegasusrc + Vector stream), once.
+# On Pegasus >= 6.0 the plugin host is native and the 3-file overlay is
+# auto-skipped; on 5.x the overlay is applied first:
 uv run python recipes/pegasus-htcondor/provision.py --install-monitord-plugin
 
 # Then opt in per run:
@@ -205,6 +268,103 @@ uv run python recipes/pegasus-htcondor/provision.py \
 That order matters — apply the ES schema before the Vector restart, or the
 first bulk write auto-creates a concrete index squatting on the
 `monitord-events-default` alias name.
+
+---
+
+## Trying `pegasus-monitor` (pegasus branch `feature/pegasus-monitor*`)
+
+`pegasus-monitor` is the new single-workflow live view / one-shot reporter from
+the pegasus `feature/pegasus-monitor*` branches (WP9b tip `1ea245081`). It is a
+self-contained pure-Python addition — `Pegasus/monitor/` + `cli/pegasus-monitor.py`
++ a `/usr/bin` wrapper — that only imports `Pegasus.braindump` and
+`Pegasus.tools.properties` from the rest of the tree, so it overlays onto the
+apt-installed Pegasus without touching pegasus-monitord, the monitord plugin
+overlay, or Vector. `overlay_pegasus_monitor.sh` does the byte-compared
+install, generates the wrapper exactly as `release-tools/update-python-tools`
+would, and writes a provenance manifest at
+`/usr/lib/pegasus/python/Pegasus/monitor/.pegasus-monitor-manifest.json`.
+It needs `rich` + `PyYAML` importable by the node's `python3` (the bootstrap's
+`pip --user` install of workflow-monitor already pulls both in).
+
+```bash
+# From a local pegasus checkout/worktree on the branch (its COMMITTED HEAD ships):
+uv run python recipes/pegasus-htcondor/provision.py \
+    --install-pegasus-monitor --pegasus-monitor-src /path/to/pegasus-wp9b
+
+# Then, on the submit node (note: --version reports the HOST pegasus version):
+pegasus-monitor --once /opt/workflows/submit/<run>/ubuntu/pegasus/diamond/run0001
+pegasus-monitor --once --diagnose <submit dir>     # source health + diagnostics
+pegasus-monitor --why-idle <submit dir>            # bounded condor evidence for idle jobs
+pegasus-monitor --serve <submit dir>               # detached JSONL writer (<submit dir>/workflow-events.jsonl)
+pegasus-monitor <submit dir> --stop-server
+pegasus-monitor --replay <submit dir>/workflow-events.jsonl --speed 0 --once
+```
+
+The script is self-contained if the FABlib token is unavailable: build the
+tarball with `git archive` (header comment in the script) and run it over SSH
+with `STAGE_TARBALL=… PEGASUS_MONITOR_REF=… bash overlay_pegasus_monitor.sh`.
+Beware the filename clash: `pegasus-monitor --serve` and `workflow-monitor
+--serve` both default to `<submit dir>/workflow-events.jsonl`, the file Vector
+tails — give one of them its own `--log PATH` before running both against the
+same submit dir (and keep anything not meant for ES out of that glob).
+
+---
+
+## Installing Pegasus from a branch as a wheel (`--install-pegasus-wheel`)
+
+The pegasus repo's developer guide (`CLAUDE.md`, "Build Environment" /
+"Installation of the wheel") tests a branch by building ONE self-contained
+`pegasus-wms` wheel with `make build` — Python packages, Java planner JARs, the
+C tools, the Go tools and a worker-package tarball — and `pip install`ing it
+into a venv. `--install-pegasus-wheel` does exactly that on the submit node,
+then installs the same wheel file on every worker, so the planner, PegasusLite
+and the worker tools are one version pool-wide. The apt Pegasus stays installed
+next to it; nothing in `/usr` is overwritten.
+
+```bash
+# A pushed branch/tag (cloned on the submit node):
+uv run python recipes/pegasus-htcondor/provision.py \
+    --install-pegasus-wheel --pegasus-wheel-ref GH-2270
+
+# Or a local checkout's COMMITTED HEAD (git-archived and uploaded):
+uv run python recipes/pegasus-htcondor/provision.py \
+    --install-pegasus-wheel --pegasus-wheel-src ~/GitHub/pegasusai/pegasus
+
+# Works on a fresh build too (runs after the pool bootstrap):
+uv run python recipes/pegasus-htcondor/provision.py --install-pegasus-wheel --pegasus-wheel-ref GH-2270
+```
+
+About 3½ minutes from scratch (toolchain + clone + ~2 min `make build` + three
+installs). `deploy/pegasus-htcondor/install_pegasus_wheel.sh` does the node
+work (`MODE=build` on the submit node, `MODE=install` on workers) and writes a
+provenance manifest at `<prefix>/.pegasus-wheel-manifest.json` (version, wheel
+sha256, source commit). Afterwards `--run-example` / `--run-workflow` put the
+wheel first on PATH automatically and print the planner they used
+(`planner: /opt/pegasus-env/bin/pegasus-plan (6.0.0.dev2270)`); by hand,
+`export PATH=/opt/pegasus-env/bin:$PATH`.
+
+Three choices differ from the guide's literal commands, each for a reason:
+
+- **Prefix `/opt/pegasus-env`, not `~/pegasus-env`** (`--pegasus-env`). The
+  pool's `UID_DOMAIN` is per-host, so worker jobs run as `nobody`, which cannot
+  traverse `/home/ubuntu` (0750). PegasusLite then finds only the apt binaries
+  in `/usr/bin`, rejects their version, and the job fails. The script refuses
+  to finish unless `nobody` can run `<prefix>/bin/pegasus-config`.
+- **`pegasus.transfer.worker.package = true`** in the submit node's
+  `~/.pegasusrc` (`--no-pegasus-wheel-worker-package` to skip). A dev build's
+  worker package is not on download.pegasus.isi.edu, so a job whose site does
+  not point `PEGASUS_HOME` at an install must carry the wheel's bundled one —
+  otherwise PegasusLite exits 71 after two 404s.
+- **Go 1.24.4 from go.dev.** The `go.mod` files need 1.24; noble ships 1.22,
+  and `GOTOOLCHAIN=auto` fails on `pegasus-globus-online`'s bare `go 1.24`
+  (no such release).
+
+Gotcha for workflow generators that compute `PEGASUS_HOME` themselves (e.g.
+`predictable-workflow-failures`): they prepend `$CONDOR_HOME/bin` = `/usr/bin`
+to PATH, which puts the apt `pegasus-version` first, so the Pegasus API plans
+with the apt planner. Export `PEGASUS_HOME`, `PEGASUS_PYTHON_LIB` and
+`CONDOR_HOME` pointing at the prefix, and check `planner_version` in the run's
+`braindump.yml`.
 
 ---
 
@@ -270,13 +430,13 @@ ifaces = []
 
 submit = slice.add_node(name="submit", site="UCSD")
 submit.set_capacities(cores=4, ram=16, disk=50)
-submit.set_image("default_ubuntu_22")
+submit.set_image("default_ubuntu_24")
 ifaces.append(submit.add_component(model="NIC_Basic", name="nic1").get_interfaces()[0])
 
 for i in (1, 2):
     w = slice.add_node(name=f"work{i}", site="UCSD")
     w.set_capacities(cores=8, ram=32, disk=50)
-    w.set_image("default_ubuntu_22")
+    w.set_image("default_ubuntu_24")
     ifaces.append(w.add_component(model="NIC_Basic", name="nic1").get_interfaces()[0])
 
 # ONE L3 network for the whole pool — same subnet => CM<->worker directly connected.
@@ -480,6 +640,7 @@ deploy/
     ├── bootstrap_pegasus_node.sh    # role-aware in-VM bring-up (uploaded + run by ↑)
     ├── install_apptainer.sh         # container-runtime install (bootstrap + --install-apptainer)
     ├── overlay_monitord_plugin.sh   # monitord plugin-system overlay (--install-monitord-plugin)
+    ├── overlay_pegasus_monitor.sh   # pegasus-monitor CLI overlay (--install-pegasus-monitor)
     ├── .pool-password               # generated shared pool key (gitignored)
     ├── condor/                      # HTCondor config drop-ins (rendered per node)
     ├── vector/vector.toml.tmpl      # node Vector config (rendered to /etc/vector/vector.toml)

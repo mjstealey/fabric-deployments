@@ -87,14 +87,22 @@ ELASTIC_INGEST_PASSWORD=… uv run python recipes/pegasus-htcondor/provision.py 
 # it was part of the bootstrap). Idempotent, no condor restart — safe while live.
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor --install-apptainer
 
-# Retrofit the pegasus-monitord plugin system + the wfmonitor adapter (see
-# deploy/MONITORD-PLUGIN.md). Run the ES side's --apply-schema FIRST. Then
-# opt in per run with --enable-monitord-plugin — by default the plugin also
-# polls condor from monitord's tick() (--monitord-tick-interval, default 5s;
+# Install the monitord plugin stack: wfmonitor adapter + ~/.pegasusrc + Vector
+# stream (see deploy/MONITORD-PLUGIN.md). On Pegasus >= 6.0 the plugin host is
+# native and the 3-file overlay is auto-skipped; on 5.x it is applied first.
+# Run the ES side's --apply-schema FIRST. Then opt in per run with
+# --enable-monitord-plugin — by default the plugin also polls condor from
+# monitord's tick() (--monitord-tick-interval, default 5s;
 # --no-monitord-condor-poll for the pegasus-events-only regression config):
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor --install-monitord-plugin
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor \
     --run-example --enable-monitord-plugin --run-name diamond-tick-2
+
+# Run the PegasusAI Studio webapp container on the submit node (docker + image,
+# passwd/group shims, IDTOKEN into the pool; see deploy/PEGASUS-HTCONDOR.md,
+# "PegasusAI Studio webapp"). The pool tracks the same development/6.0 Pegasus
+# channel the image bundles — host/container skew aborts DAGs.
+uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor --install-studio
 
 # Infra + routing only (inspect before installing the stack):
 uv run python recipes/pegasus-htcondor/provision.py --name pegasus-htcondor

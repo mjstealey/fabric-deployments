@@ -22,7 +22,11 @@
 #   HTCONDOR_VERSION       exact HTCondor apt version, e.g. 25.12.2    (channel latest)
 #   HTCONDOR_CHANNEL       wisc repo channel                           (<major>.x of
 #                          HTCONDOR_VERSION, else 24.x)
-#   PEGASUS_VERSION        Pegasus apt version (best-effort)           (5.1.2)
+#   PEGASUS_CHANNEL        Pegasus apt channel under download.pegasus.isi.edu:
+#                          'release' (stable top-level repo) or a subdir
+#                          like development/6.0                        (development/6.0)
+#   PEGASUS_VERSION        pin a Pegasus apt version, prefix-matched
+#                          within the channel (best-effort)            (unset = channel latest)
 #   INSTALL_APPTAINER      install Apptainer container runtime         (1; 0 to skip)
 #   PEG_DIR                uploaded asset dir                          ($HOME/pegasus-htcondor)
 #   RUNS_DIR              (cm) absolute submit-dir root                (/opt/workflows)
@@ -42,7 +46,27 @@ if [ -n "${HTCONDOR_VERSION}" ]; then
 else
   HTCONDOR_CHANNEL="${HTCONDOR_CHANNEL:-24.x}"
 fi
-PEGASUS_VERSION="${PEGASUS_VERSION:-5.1.2}"
+# Track the development/6.0 channel by default, UNPINNED: the studio-webapp
+# :main container image bundles Pegasus from the same channel, and host/container
+# skew breaks runs (a 5.1.2 host pegasus-exitcode exits 2 on the 6.0 planner's
+# -R/-M POST-script flags, aborting every DAG). A date pin here would drift from
+# the image immediately. Set PEGASUS_VERSION only to pin within the channel.
+PEGASUS_CHANNEL="${PEGASUS_CHANNEL:-development/6.0}"
+PEGASUS_VERSION="${PEGASUS_VERSION:-}"
+# 'release' is the stable top-level repo; anything else names a subdir of the
+# download server. development/6.0 publishes noble+resolute dists ONLY (no
+# jammy) and its deb hard-depends on libc6 >= 2.38, i.e. Ubuntu 24.
+# The development channels serve a bare Release (no InRelease/Release.gpg as
+# of 2026-08), so apt rejects them as unsigned unless this ONE source opts out
+# of signature verification with trusted=yes (the studio image's Dockerfile
+# does the same). The release repo IS signed — keep signed-by.
+if [ "${PEGASUS_CHANNEL}" = "release" ]; then
+  PEGASUS_REPO_URL="https://download.pegasus.isi.edu/pegasus/ubuntu"
+  PEGASUS_REPO_OPTS="signed-by=/usr/share/keyrings/pegasus.gpg"
+else
+  PEGASUS_REPO_URL="https://download.pegasus.isi.edu/pegasus/${PEGASUS_CHANNEL}/ubuntu"
+  PEGASUS_REPO_OPTS="trusted=yes"
+fi
 PEG_DIR="${PEG_DIR:-$HOME/pegasus-htcondor}"
 RUNS_DIR="${RUNS_DIR:-/opt/workflows}"
 ES_HOST="${ES_HOST:-workflow-monitor-es}"
@@ -64,12 +88,24 @@ VECTOR_DEB_URL="${VECTOR_DEB_URL:-https://github.com/vectordotdev/vector/release
 
 log() { printf '\n=== %s ===\n' "$*"; }
 export DEBIAN_FRONTEND=noninteractive
+# noble's python3 is externally managed (PEP 668): pip refuses --user installs
+# without this opt-out. Safe on jammy too — pip <23 has no such option and env
+# vars are only consulted for options the running pip actually defines.
+export PIP_BREAK_SYSTEM_PACKAGES=1
 
 # --- 1. base deps ----------------------------------------------------------
 log "installing base packages"
+# Self-heal a stale pegasus.list BEFORE the first apt-get update: a wrong line
+# left by an older bootstrap (e.g. signed-by against the unsigned dev channel)
+# fails this update under set -e, before the Pegasus section could rewrite it.
+# Rewrite-if-present only — first install (plus the keyring) happens below.
+if [ -f /etc/apt/sources.list.d/pegasus.list ]; then
+  echo "deb [${PEGASUS_REPO_OPTS}] ${PEGASUS_REPO_URL} $(lsb_release -cs) main" \
+    | sudo tee /etc/apt/sources.list.d/pegasus.list >/dev/null
+fi
 sudo apt-get update -y
 sudo apt-get install -y curl gnupg ca-certificates lsb-release python3 python3-pip unzip git
-CODENAME="$(lsb_release -cs)"   # 'jammy' on default_ubuntu_22
+CODENAME="$(lsb_release -cs)"   # 'noble' on default_ubuntu_24
 
 # --- 2. HTCondor -----------------------------------------------------------
 if ! command -v condor_version >/dev/null 2>&1; then
@@ -146,15 +182,25 @@ sudo systemctl restart condor
 # Submit node needs the planner; execute nodes need pegasus-keg + the worker
 # tools (pegasus-kickstart/transfer) for condorio 'installed' transformations.
 if ! command -v pegasus-version >/dev/null 2>&1; then
-  log "installing Pegasus ${PEGASUS_VERSION} (download.pegasus.isi.edu repo)"
+  log "installing Pegasus (${PEGASUS_CHANNEL} channel${PEGASUS_VERSION:+, pin ${PEGASUS_VERSION}})"
   curl -fsSL https://download.pegasus.isi.edu/pegasus/gpg.txt \
     | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/pegasus.gpg
-  echo "deb [signed-by=/usr/share/keyrings/pegasus.gpg] https://download.pegasus.isi.edu/pegasus/ubuntu ${CODENAME} main" \
+  echo "deb [${PEGASUS_REPO_OPTS}] ${PEGASUS_REPO_URL} ${CODENAME} main" \
     | sudo tee /etc/apt/sources.list.d/pegasus.list >/dev/null
   sudo apt-get update -y
-  sudo apt-get install -y "pegasus=${PEGASUS_VERSION}-1+${CODENAME}" \
-    || sudo apt-get install -y pegasus \
-    || echo "  ! Pegasus apt install failed; see PEGASUS-HTCONDOR.md for alternatives"
+  if [ -n "${PEGASUS_VERSION}" ]; then
+    # Best-effort pin, resolved by prefix — the channels differ in suffix style
+    # (5.1.2-1+jammy vs 6.0.0~-dev.02026...-1+ubuntu24). awk must read ALL
+    # input (no early exit): see the condor pin above for the pipefail reason.
+    PEG_APT_VER="$(apt-cache madison pegasus \
+      | awk -v v="${PEGASUS_VERSION}" 'ver == "" && index($3, v) == 1 {ver=$3} END{print ver}')"
+    sudo apt-get install -y "pegasus=${PEG_APT_VER:-${PEGASUS_VERSION}}" \
+      || sudo apt-get install -y pegasus \
+      || echo "  ! Pegasus apt install failed; see PEGASUS-HTCONDOR.md for alternatives"
+  else
+    sudo apt-get install -y pegasus \
+      || echo "  ! Pegasus apt install failed; see PEGASUS-HTCONDOR.md for alternatives"
+  fi
 fi
 
 # --- 4b. Apptainer (container runtime, ALL nodes) --------------------------
@@ -171,6 +217,9 @@ bash "${PEG_DIR}/install_apptainer.sh" || true
 if [ "${ROLE}" != "cm" ]; then
   log "execute node ready"
   condor_version || true
+  # Sentinel the provisioner greps for: fablib's execute() does not surface the
+  # remote exit code, so a set -e death mid-script is otherwise silent.
+  echo "BOOTSTRAP_COMPLETE role=${ROLE}"
   exit 0
 fi
 
@@ -246,3 +295,4 @@ log "submit/CM node ready"
 condor_status -schedd 2>/dev/null || true
 echo "pool central manager: ${CONDOR_HOST}"
 echo "submit a workflow under: workflow-monitor ${RUNS_DIR}/submit/<run> --serve --diagnose --log"
+echo "BOOTSTRAP_COMPLETE role=${ROLE}"

@@ -26,12 +26,21 @@ What it does
              workflow-monitor + Vector (Vector stays stopped until --wire-es)
   apptainer  (--install-apptainer) retrofit just the container runtime onto an
              existing slice (idempotent, no condor restart -- safe on a live pool)
-  plugin     (--install-monitord-plugin) retrofit the pegasus-monitord plugin
-             system + the wfmonitor adapter onto the submit node and add the
-             monitord-events stream to Vector (deploy/MONITORD-PLUGIN.md);
-             per-run opt-in via --enable-monitord-plugin on the run actions
+  plugin     (--install-monitord-plugin) install the monitord plugin stack on
+             the submit node: the wfmonitor adapter + ~/.pegasusrc enablement +
+             the monitord-events Vector stream (deploy/MONITORD-PLUGIN.md).
+             On Pegasus >= 6.0 the plugin host is native (the 3-file overlay is
+             auto-skipped); on 5.x the overlay is applied first. Per-run
+             opt-in via --enable-monitord-plugin on the run actions
+  monitor    (--install-pegasus-monitor --pegasus-monitor-src DIR) overlay the
+             pegasus-monitor CLI from a local pegasus checkout onto the submit
+             node's apt Pegasus (pure Python; independent of the plugin overlay)
   wire-es    (--wire-es) upload the ES slice's CA, finalize the Vector sink, and
-             start Vector on the submit node
+             start Vector on the submit node (--es-ip also writes /etc/hosts)
+  studio     (--install-studio) run the PegasusAI Studio webapp container on
+             the submit node: it plans with the image's own Pegasus (the
+             development/6.0 channel this pool tracks) through the HOST schedd,
+             authenticating with an IDTOKEN
   example    (--run-example) plan+submit a tiny diamond workflow under
              workflow-monitor as an end-to-end smoke test
   workflow   (--run-workflow URL|DIR) clone/use a real workflow, optionally
@@ -67,6 +76,7 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -96,6 +106,9 @@ VECTOR_TMPL = PEG_DIR / "vector" / "vector.toml.tmpl"
 VECTOR_SERVICE = REPO_ROOT / "deploy" / "vector" / "vector.service"
 EXAMPLE_WF = PEG_DIR / "examples" / "diamond.py"
 OVERLAY_SH = PEG_DIR / "overlay_monitord_plugin.sh"
+PEGASUS_MONITOR_SH = PEG_DIR / "overlay_pegasus_monitor.sh"
+PEGASUS_WHEEL_SH = PEG_DIR / "install_pegasus_wheel.sh"
+PEGASUS_REPO_URL = "https://github.com/pegasus-isi/pegasus.git"
 POOL_PW_FILE = PEG_DIR / ".pool-password"
 # Same path the ES provisioner downloads its CA to (this file is in deploy/fabric/).
 CA_DEFAULT = Path(__file__).resolve().parent / "ca.crt"
@@ -120,6 +133,9 @@ CONDOR_FILES = [
 # three overlay files are byte-identical to the previous pins 317a020a3 and
 # e7da14941 (the 50-commit delta from 317a020a3 is main-side only: monitoring/
 # workflow.py, docs, java -- it never touches the overlay surface).
+# On the development/6.0 apt channel the plugin system is IN the deb:
+# install_monitord_plugin detects the native host and skips the overlay, so
+# this ref only matters for 5.x trees.
 MONITORD_PLUGIN_REF = "da1db847c685cb6c1f34d7c8de8c7af26f5c1997"
 MONITORD_PLUGIN_FILES = [  # repo-relative under packages/pegasus-python/src/Pegasus/
     "monitoring/plugin.py",
@@ -145,6 +161,13 @@ WFEVENTS_PLUGIN_SPEC = (
 )
 # pip distribution name (NOT "wfevents" -- the import package is monitord_wfevents).
 WFEVENTS_DIST = "pegasus-monitord-plugin-wfevents"
+
+# PegasusAI Studio webapp (--install-studio). The :main image bundles Pegasus
+# from the development/6.0 apt channel — the reason the pool tracks that same
+# channel: the container plans, but DAGMan + jobs run under the HOST schedd, so
+# host/container Pegasus skew aborts DAGs (5.1.2 pegasus-exitcode exits 2 on
+# the 6.0 planner's -R/-M POST-script flags).
+STUDIO_IMAGE = "ghcr.io/pegasus-isi/studio-webapp:main"
 
 
 def _load_fablib():
@@ -367,9 +390,11 @@ def _bootstrap_node(node, role, node_ip, submit_ip, fabnet_cidr, pw, args):
         f"NODE_IP={node_ip} "
         f"FABNET_CIDR={fabnet_cidr} "
         f"POOL_PASSWORD={pw} "
-        f"PEGASUS_VERSION={args.pegasus_version} "
+        f"PEGASUS_CHANNEL={args.pegasus_channel} "
         f"PEG_DIR=$HOME/{REMOTE_DIR}"
     )
+    if args.pegasus_version:
+        env += f" PEGASUS_VERSION={args.pegasus_version}"
     if args.htcondor_version:
         env += f" HTCONDOR_VERSION={args.htcondor_version}"
     if role == "cm":
@@ -385,6 +410,16 @@ def _bootstrap_node(node, role, node_ip, submit_ip, fabnet_cidr, pw, args):
     )
     if stderr and stderr.strip():
         print(f"  [{node.get_name()} bootstrap stderr]\n" + stderr)
+    # fablib's execute() does not surface the remote exit code, so grep for the
+    # script's completion sentinel — a set -e death (e.g. an apt failure)
+    # otherwise reads as success and leaves a half-bootstrapped node.
+    if "BOOTSTRAP_COMPLETE" not in (stdout or ""):
+        sys.exit(
+            f"error: bootstrap did NOT complete on {node.get_name()} (no "
+            "BOOTSTRAP_COMPLETE sentinel; scroll up for the failing step). "
+            "Fix the cause and re-run with --rebootstrap — the script is "
+            "idempotent."
+        )
 
 
 def bootstrap_pool(slice_obj, submit_ip, fabnet_cidr, args):
@@ -540,16 +575,20 @@ def _update_vector_config(submit, args):
 
 
 def install_monitord_plugin(slice_obj, args):
-    """Retrofit the monitord plugin stack onto the submit node (idempotent).
+    """Install the monitord plugin stack onto the submit node (idempotent).
 
-    Four steps, in order:
+    Steps, in order:
       1. overlay the 3 pegasus-monitord plugin files onto the apt-installed
-         tree (overlay_monitord_plugin.sh; provenance manifest on the node)
+         tree (overlay_monitord_plugin.sh; provenance manifest on the node).
+         SKIPPED when the apt tree already ships the plugin host natively —
+         the monitord-plugin-system branch merged for 6.0, so the
+         development/6.0 debs carry it; only 5.x trees need the retrofit.
       2. install the workflow-monitor build that registers the wfmonitor
          plugin (--monitord-adapter-spec: pip spec or local directory)
       3. verify the entry point loads with the same python3 the monitord
          wrapper picks (fails loudly -- monitord would silently run without
-         the plugin otherwise)
+         the plugin otherwise), and enable the plugin in ~/.pegasusrc so runs
+         planned OUTSIDE this script (e.g. the studio container) get it too
       4. re-render the Vector config (adds the monitord-events stream) and
          restart Vector
 
@@ -560,36 +599,54 @@ def install_monitord_plugin(slice_obj, args):
     submit = slice_obj.get_node(args.submit_node)
     print(f"==> installing the monitord plugin stack on '{args.submit_node}'")
 
-    # (1) overlay the pegasus files
-    if not OVERLAY_SH.exists():
-        sys.exit(f"error: {OVERLAY_SH} not found")
-    submit.execute(f"mkdir -p ~/{REMOTE_DIR}/monitord-plugin")
-    submit.upload_file(str(OVERLAY_SH), f"{REMOTE_DIR}/overlay_monitord_plugin.sh")
-    env = f"PEGASUS_PLUGIN_REF={args.pegasus_plugin_ref} "
-    if args.pegasus_src:
-        src = Path(args.pegasus_src).expanduser().resolve()
-        base = src / "packages" / "pegasus-python" / "src" / "Pegasus"
-        for rel in MONITORD_PLUGIN_FILES:
-            local = base / rel
-            if not local.exists():
-                sys.exit(f"error: {local} not found (is --pegasus-src a checkout?)")
-            submit.upload_file(
-                str(local), f"{REMOTE_DIR}/monitord-plugin/{Path(rel).name}"
-            )
-        env += f"SOURCE_MODE=uploaded PEGASUS_SRC_DESC={_git_desc(src)!r} "
-        print(f"  uploaded 3 files from {src} ({_git_desc(src)})")
-    else:
-        env += "SOURCE_MODE=fetch "
-    out, err = submit.execute(
-        f"chmod +x ~/{REMOTE_DIR}/overlay_monitord_plugin.sh && {env}"
-        f"STAGE_DIR=$HOME/{REMOTE_DIR}/monitord-plugin "
-        f"bash ~/{REMOTE_DIR}/overlay_monitord_plugin.sh"
+    # (1) overlay the pegasus files — unless the plugin host is native. A
+    # manifest without the native marker means a previous 5.x overlay (re-run
+    # it, byte-compared and idempotent); plugin.py with no manifest means the
+    # deb itself ships the plugin system (Pegasus >= 6.0) — nothing to overlay.
+    out, _ = submit.execute(
+        f"if test -f {MONITORD_MANIFEST} "
+        f"&& ! grep -q native-plugin-host {MONITORD_MANIFEST}; then echo OVERLAID; "
+        "elif test -f /usr/lib/pegasus/python/Pegasus/monitoring/plugin.py; "
+        "then echo NATIVE; else echo NEEDS_OVERLAY; fi",
+        quiet=True,
     )
-    print(out)
-    if "OVERLAY_COMPLETE" not in (out or ""):
-        if err and err.strip():
-            print("  [overlay stderr]\n" + err)
-        sys.exit("error: monitord plugin overlay did not complete")
+    native = "NATIVE" in (out or "")
+    if native:
+        ver, _ = submit.execute("pegasus-version", quiet=True)
+        print(
+            f"  plugin host is native in this Pegasus ({(ver or '?').strip()}); "
+            "skipping the 3-file overlay"
+        )
+    else:
+        if not OVERLAY_SH.exists():
+            sys.exit(f"error: {OVERLAY_SH} not found")
+        submit.execute(f"mkdir -p ~/{REMOTE_DIR}/monitord-plugin")
+        submit.upload_file(str(OVERLAY_SH), f"{REMOTE_DIR}/overlay_monitord_plugin.sh")
+        env = f"PEGASUS_PLUGIN_REF={args.pegasus_plugin_ref} "
+        if args.pegasus_src:
+            src = Path(args.pegasus_src).expanduser().resolve()
+            base = src / "packages" / "pegasus-python" / "src" / "Pegasus"
+            for rel in MONITORD_PLUGIN_FILES:
+                local = base / rel
+                if not local.exists():
+                    sys.exit(f"error: {local} not found (is --pegasus-src a checkout?)")
+                submit.upload_file(
+                    str(local), f"{REMOTE_DIR}/monitord-plugin/{Path(rel).name}"
+                )
+            env += f"SOURCE_MODE=uploaded PEGASUS_SRC_DESC={_git_desc(src)!r} "
+            print(f"  uploaded 3 files from {src} ({_git_desc(src)})")
+        else:
+            env += "SOURCE_MODE=fetch "
+        out, err = submit.execute(
+            f"chmod +x ~/{REMOTE_DIR}/overlay_monitord_plugin.sh && {env}"
+            f"STAGE_DIR=$HOME/{REMOTE_DIR}/monitord-plugin "
+            f"bash ~/{REMOTE_DIR}/overlay_monitord_plugin.sh"
+        )
+        print(out)
+        if "OVERLAY_COMPLETE" not in (out or ""):
+            if err and err.strip():
+                print("  [overlay stderr]\n" + err)
+            sys.exit("error: monitord plugin overlay did not complete")
 
     # (2) install the adapter build of workflow-monitor
     spec = args.monitord_adapter_spec
@@ -605,8 +662,10 @@ def install_monitord_plugin(slice_obj, args):
     # Two passes: the first covers dependencies if this node never had
     # workflow-monitor; the second guarantees the package itself is rebuilt at
     # the requested ref even though the version number (0.1.0) never moves.
+    # PIP_BREAK_SYSTEM_PACKAGES: noble's python3 is externally managed (PEP
+    # 668); pip <23 (jammy) never reads the env var, so it is harmless there.
     out, err = submit.execute(
-        'export PATH="$HOME/.local/bin:$PATH"; '
+        'export PATH="$HOME/.local/bin:$PATH" PIP_BREAK_SYSTEM_PACKAGES=1; '
         f'python3 -m pip install --user --quiet "{pip_spec}" && '
         f'python3 -m pip install --user --quiet --force-reinstall --no-deps "{pip_spec}" '
         "&& echo PIP_OK"
@@ -633,7 +692,10 @@ def install_monitord_plugin(slice_obj, args):
         )
     print("  wfmonitor entry point loads (pegasus.monitord.plugins)")
 
-    # Record the adapter provenance in the overlay manifest.
+    # Record the adapter provenance in the manifest. On a native (>= 6.0) tree
+    # the overlay never ran, so create the manifest here with the marker the
+    # step-1 probe greps for — that keeps a re-run of this function from
+    # mistaking the native tree for an overlaid one.
     commit_q = (
         "import importlib.metadata as m, json; "
         "raw = m.distribution('workflow-monitor').read_text('direct_url.json'); "
@@ -643,13 +705,25 @@ def install_monitord_plugin(slice_obj, args):
     commit, _ = submit.execute(f'python3 -c "{commit_q}"', quiet=True)
     commit = (commit or "unknown").strip().splitlines()[-1]
     submit.execute(
-        f"sudo python3 -c \"import json; p = '{MONITORD_MANIFEST}'; "
-        "m = json.load(open(p)); "
+        f"sudo python3 -c \"import json, os; p = '{MONITORD_MANIFEST}'; "
+        "m = json.load(open(p)) if os.path.exists(p) "
+        "else {'source': 'native-plugin-host'}; "
         f"m['adapter_spec'] = '{spec}'; m['adapter_resolved'] = '{commit}'; "
         "m['entry_point_ok'] = True; "
         "json.dump(m, open(p, 'w'), indent=2)\""
     )
     print(f"  adapter resolved: {commit}")
+
+    # Plan-time enablement for runs planned outside this script: pegasus-monitord
+    # folds ONLY ~/.pegasusrc (not /etc or env) into the plan-time properties
+    # snapshot, so this line is what turns the wfmonitor plugin on for e.g. the
+    # studio container's Run button. --enable-monitord-plugin still writes the
+    # per-run properties for --run-example/--run-workflow.
+    submit.execute(
+        "grep -qs '^pegasus.monitord.plugins.wfmonitor.enabled' ~/.pegasusrc "
+        "|| echo 'pegasus.monitord.plugins.wfmonitor.enabled = true' >> ~/.pegasusrc"
+    )
+    print("  ~/.pegasusrc: pegasus.monitord.plugins.wfmonitor.enabled = true")
 
     # (4) refresh Vector so the monitord-events stream ships
     _update_vector_config(submit, args)
@@ -659,15 +733,267 @@ def install_monitord_plugin(slice_obj, args):
     )
 
 
+def install_pegasus_monitor(slice_obj, args):
+    """Overlay the pegasus-monitor CLI from a local pegasus checkout (idempotent).
+
+    pegasus-monitor (pegasus branch feature/pegasus-monitor*) is a
+    self-contained pure-Python addition: Pegasus/monitor/ + cli/pegasus-monitor.py
+    + a /usr/bin wrapper. `git archive` those two paths at the checkout's HEAD,
+    upload the tarball, and let overlay_pegasus_monitor.sh do the byte-compared
+    install, wrapper generation and provenance manifest. Independent of the
+    monitord plugin overlay: touches neither pegasus-monitord nor Vector.
+    """
+    src = Path(args.pegasus_monitor_src or "").expanduser()
+    if (
+        not args.pegasus_monitor_src
+        or not (
+            src / "packages" / "pegasus-python" / "src" / "Pegasus" / "monitor"
+        ).is_dir()
+    ):
+        sys.exit(
+            "error: --install-pegasus-monitor needs --pegasus-monitor-src DIR, a "
+            "pegasus checkout on a feature/pegasus-monitor* branch "
+            "(packages/pegasus-python/src/Pegasus/monitor/ must exist)"
+        )
+    src = src.resolve()
+    if not PEGASUS_MONITOR_SH.exists():
+        sys.exit(f"error: {PEGASUS_MONITOR_SH} not found")
+    ref = subprocess.run(
+        ["git", "-C", str(src), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    desc = _git_desc(src)
+    submit = slice_obj.get_node(args.submit_node)
+    print(f"==> installing pegasus-monitor on '{args.submit_node}' from {src} ({desc})")
+    if desc.endswith("-dirty"):
+        print(
+            "  WARNING: checkout is dirty -- git archive ships the COMMITTED tree "
+            "at HEAD; uncommitted edits are not uploaded"
+        )
+
+    fd, tarball = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(fd)
+    remote_tar = f"{REMOTE_DIR}/pegasus-monitor-{ref[:9]}.tar.gz"
+    try:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(src),
+                "archive",
+                "--format=tar.gz",
+                "-o",
+                tarball,
+                "HEAD",
+                "packages/pegasus-python/src/Pegasus/monitor",
+                "packages/pegasus-python/src/Pegasus/cli/pegasus-monitor.py",
+            ],
+            check=True,
+        )
+        submit.execute(f"mkdir -p ~/{REMOTE_DIR}")
+        submit.upload_file(tarball, remote_tar)
+    finally:
+        os.unlink(tarball)
+    submit.upload_file(
+        str(PEGASUS_MONITOR_SH), f"{REMOTE_DIR}/overlay_pegasus_monitor.sh"
+    )
+    out, err = submit.execute(
+        f"chmod +x ~/{REMOTE_DIR}/overlay_pegasus_monitor.sh && "
+        f"STAGE_TARBALL=$HOME/{remote_tar} PEGASUS_MONITOR_REF={ref} "
+        f"PEGASUS_SRC_DESC={desc!r} STAGE_DIR=$HOME/{REMOTE_DIR}/pegasus-monitor "
+        f"bash ~/{REMOTE_DIR}/overlay_pegasus_monitor.sh"
+    )
+    print(out)
+    if "OVERLAY_COMPLETE" not in (out or ""):
+        if err and err.strip():
+            print("  [overlay stderr]\n" + err)
+        sys.exit("error: pegasus-monitor overlay did not complete")
+    print(
+        "  done. Smoke-test on the submit node: "
+        "pegasus-monitor --once <submit dir>  (deploy/PEGASUS-HTCONDOR.md)"
+    )
+
+
+def _run_wheel_script(node, env):
+    """Run install_pegasus_wheel.sh on node with env; return (stdout, ok)."""
+    node.execute(f"mkdir -p ~/{REMOTE_DIR}")
+    node.upload_file(str(PEGASUS_WHEEL_SH), f"{REMOTE_DIR}/install_pegasus_wheel.sh")
+    assignments = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
+    out, err = node.execute(
+        f"chmod +x ~/{REMOTE_DIR}/install_pegasus_wheel.sh && "
+        f"{assignments} bash ~/{REMOTE_DIR}/install_pegasus_wheel.sh 2>&1"
+    )
+    ok = "WHEEL_INSTALL_COMPLETE" in (out or "")
+    if not ok and err and err.strip():
+        out = (out or "") + "\n[stderr]\n" + err
+    return out or "", ok
+
+
+def install_pegasus_wheel(slice_obj, args):
+    """Build the pegasus-wms wheel on the submit node and install it pool-wide.
+
+    Follows the pegasus repo's developer guide (CLAUDE.md "Build Environment"
+    / "Installation of the wheel"): `make build` in a build venv, then
+    `pip install --force-reinstall` of the resulting self-contained wheel
+    (Python + Java planner + C/Go tools + worker package) into a venv. The same
+    wheel file is then installed on every worker, so planner, PegasusLite and
+    the worker tools are one version everywhere. The apt Pegasus is left in
+    place; runs pick the wheel by PATH (see _pegasus_env_prefix).
+
+    Source: --pegasus-wheel-ref (branch/tag cloned from --pegasus-wheel-repo),
+    or --pegasus-wheel-src DIR (git-archive of that checkout's COMMITTED HEAD).
+    """
+    if bool(args.pegasus_wheel_ref) == bool(args.pegasus_wheel_src):
+        sys.exit(
+            "error: --install-pegasus-wheel needs exactly one of "
+            "--pegasus-wheel-ref REF or --pegasus-wheel-src DIR"
+        )
+    if not PEGASUS_WHEEL_SH.exists():
+        sys.exit(f"error: {PEGASUS_WHEEL_SH} not found")
+    prefix = args.pegasus_env
+    submit = slice_obj.get_node(args.submit_node)
+    env = {"MODE": "build", "PEGASUS_ENV": prefix}
+    tarball = None
+    if args.pegasus_wheel_src:
+        src = Path(args.pegasus_wheel_src).expanduser().resolve()
+        if not (src / "pyproject.toml").is_file() or not (src / "Makefile").is_file():
+            sys.exit(f"error: {src} does not look like a pegasus checkout")
+        ref = subprocess.run(
+            ["git", "-C", str(src), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        desc = _git_desc(src)
+        if desc.endswith("-dirty"):
+            print(
+                "  WARNING: checkout is dirty -- git archive ships the COMMITTED "
+                "tree at HEAD; uncommitted edits are not uploaded"
+            )
+        fd, tarball = tempfile.mkstemp(suffix=".tar.gz")
+        os.close(fd)
+        remote_tar = f"{REMOTE_DIR}/pegasus-src-{ref[:9]}.tar.gz"
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(src),
+                    "archive",
+                    "--format=tar.gz",
+                    "-o",
+                    tarball,
+                    "HEAD",
+                ],
+                check=True,
+            )
+            submit.execute(f"mkdir -p ~/{REMOTE_DIR}")
+            submit.upload_file(tarball, remote_tar)
+        finally:
+            os.unlink(tarball)
+        env.update(
+            STAGE_TARBALL=f"$HOME/{remote_tar}",
+            PEGASUS_SOURCE_COMMIT=ref,
+            PEGASUS_SRC_DESC=f"{src.name}@{desc}",
+        )
+        label = f"{src} ({desc})"
+    else:
+        env.update(
+            PEGASUS_REF=args.pegasus_wheel_ref, PEGASUS_REPO=args.pegasus_wheel_repo
+        )
+        label = f"{args.pegasus_wheel_repo}@{args.pegasus_wheel_ref}"
+    print(f"==> building the pegasus-wms wheel on '{args.submit_node}' from {label}")
+    # STAGE_TARBALL carries $HOME, so it alone is left unquoted for the shell.
+    node_env = " ".join(
+        f"{k}={v}" if k == "STAGE_TARBALL" else f"{k}={shlex.quote(str(v))}"
+        for k, v in env.items()
+    )
+    submit.execute(f"mkdir -p ~/{REMOTE_DIR}")
+    submit.upload_file(str(PEGASUS_WHEEL_SH), f"{REMOTE_DIR}/install_pegasus_wheel.sh")
+    out, err = submit.execute(
+        f"chmod +x ~/{REMOTE_DIR}/install_pegasus_wheel.sh && "
+        f"{node_env} bash ~/{REMOTE_DIR}/install_pegasus_wheel.sh 2>&1 | "
+        "grep -v -E '^(-- |\\[ *[0-9]+%\\]|gmake|cmake |Building |Scanning )'"
+    )
+    print(out)
+    wheel_path = next(
+        (
+            line.split(None, 1)[1].strip()
+            for line in (out or "").splitlines()
+            if line.startswith("WHEEL_PATH ")
+        ),
+        None,
+    )
+    if "WHEEL_INSTALL_COMPLETE" not in (out or "") or not wheel_path:
+        if err and err.strip():
+            print("  [build stderr]\n" + err[-4000:])
+        sys.exit(
+            "error: pegasus wheel build/install did not complete on the submit node"
+        )
+
+    workers = _worker_names(args)
+    if workers:
+        fd, local_wheel = tempfile.mkstemp(suffix=".whl")
+        os.close(fd)
+        try:
+            print(
+                f"==> fetching {Path(wheel_path).name} to install on {', '.join(workers)}"
+            )
+            submit.download_file(local_wheel, wheel_path)
+            remote_wheel = f"{REMOTE_DIR}/{Path(wheel_path).name}"
+            for name in workers:
+                node = slice_obj.get_node(name)
+                node.execute(f"mkdir -p ~/{REMOTE_DIR}")
+                node.upload_file(local_wheel, remote_wheel)
+                wout, ok = _run_wheel_script(
+                    node,
+                    {
+                        "MODE": "install",
+                        "PEGASUS_ENV": prefix,
+                        "WHEEL": f"/home/ubuntu/{remote_wheel}",
+                        "PEGASUS_SRC_DESC": label,
+                    },
+                )
+                print(f"  [{name}] " + "\n  ".join(wout.strip().splitlines()[-3:]))
+                if not ok:
+                    sys.exit(f"error: wheel install did not complete on {name}")
+        finally:
+            os.unlink(local_wheel)
+
+    if args.pegasus_wheel_worker_package:
+        # A dev build's worker package is not on download.pegasus.isi.edu, so
+        # jobs whose site does not point PEGASUS_HOME at an install must carry
+        # the wheel's bundled worker package. ~/.pegasusrc is folded into every
+        # plan on the submit node.
+        submit.execute(
+            "touch ~/.pegasusrc && "
+            "grep -qs '^pegasus.transfer.worker.package' ~/.pegasusrc "
+            "|| echo 'pegasus.transfer.worker.package = true' >> ~/.pegasusrc"
+        )
+        print("  ~/.pegasusrc: pegasus.transfer.worker.package = true")
+    print(
+        f"  done. Runs from this provisioner now prefer {prefix}/bin; by hand: "
+        f"export PATH={prefix}/bin:$PATH  (deploy/PEGASUS-HTCONDOR.md)"
+    )
+
+
+def _pegasus_env_prefix(args):
+    """Shell prefix that puts the wheel install first on PATH when present."""
+    prefix = shlex.quote(args.pegasus_env)
+    return f"if [ -x {prefix}/bin/pegasus-plan ]; then export PATH={prefix}/bin:$PATH; fi; "
+
+
 def install_wfevents_plugin(slice_obj, args):
     """Retrofit the standalone wfevents monitord plugin onto the submit node.
 
     Unlike --install-monitord-plugin this touches neither the pegasus tree nor
     Vector: wfevents is an ordinary pip package that registers itself in the
     pegasus.monitord.plugins entry-point group, and Vector does not tail the
-    wfevents.jsonl it writes. It does ride the same plugin host, so the 3-file
-    overlay (--install-monitord-plugin) must already be on the node -- without
-    it pegasus-monitord has no plugin system to discover the entry point.
+    wfevents.jsonl it writes. It does need a plugin host to discover the entry
+    point: native in Pegasus >= 6.0, otherwise the 3-file overlay
+    (--install-monitord-plugin) must already be on the node.
 
     Idempotent; opt in per run with --enable-wfevents-plugin.
     """
@@ -677,13 +1003,15 @@ def install_wfevents_plugin(slice_obj, args):
     # The plugin host is what discovers entry points -- warn loudly if absent
     # rather than leaving a silently inert plugin behind.
     out, _ = submit.execute(
-        f"test -f {MONITORD_MANIFEST} && echo OVERLAY_PRESENT || echo OVERLAY_ABSENT",
+        "test -f /usr/lib/pegasus/python/Pegasus/monitoring/plugin.py "
+        "&& echo HOST_PRESENT || echo HOST_ABSENT",
         quiet=True,
     )
-    if "OVERLAY_PRESENT" not in (out or ""):
+    if "HOST_PRESENT" not in (out or ""):
         print(
-            "  ! no monitord plugin overlay manifest on this node — wfevents "
-            "will install but pegasus-monitord has no plugin host to load it.\n"
+            "  ! no monitord plugin host on this node (neither a >= 6.0 native "
+            "tree nor the 5.x overlay) — wfevents will install but "
+            "pegasus-monitord cannot load it.\n"
             "    Run --install-monitord-plugin first."
         )
 
@@ -692,7 +1020,7 @@ def install_wfevents_plugin(slice_obj, args):
     # Two passes for the same reason as the adapter: the version number does not
     # move between commits, so only --force-reinstall guarantees the requested ref.
     out, err = submit.execute(
-        'export PATH="$HOME/.local/bin:$PATH"; '
+        'export PATH="$HOME/.local/bin:$PATH" PIP_BREAK_SYSTEM_PACKAGES=1; '
         f'python3 -m pip install --user --quiet "{spec}" && '
         f'python3 -m pip install --user --quiet --force-reinstall --no-deps "{spec}" '
         "&& echo PIP_OK"
@@ -744,6 +1072,116 @@ def install_wfevents_plugin(slice_obj, args):
 
 
 # ---------------------------------------------------------------------------
+# PegasusAI Studio webapp container
+# ---------------------------------------------------------------------------
+
+
+def install_studio(slice_obj, args):
+    """Run the PegasusAI Studio webapp container on the submit node (idempotent).
+
+    The studio plans/submits THROUGH the host's schedd: --network host plus the
+    _CONDOR_* env point its condor tools at the host pool, and it authenticates
+    with an IDTOKEN minted here (FS auth cannot cross the container boundary —
+    00-pool-common.conf lists IDTOKENS for exactly this client).
+
+    Pieces, ALL required:
+      - docker (docker.io apt package) + the image
+      - container-passwd/group: the image's own /etc/passwd + /etc/group with a
+        uid-1000 'ubuntu' line appended, bind-mounted read-only. Without them
+        uid 1000 resolves to '?' inside the container and Pegasus plans into a
+        literal '?/' submit dir.
+      - an IDTOKEN for ubuntu@TRUST_DOMAIN in ~/.condor/tokens.d/studio
+      - /home/ubuntu bind-mounted so plans land on the host filesystem
+
+    Re-running recreates the container (docker rm -f + run); the studio's own
+    state (~/.studio/studio.db) lives on the host and survives.
+    """
+    submit = slice_obj.get_node(args.submit_node)
+    _, submit_ip, _ = _node_fabnet(slice_obj, args.submit_node)
+    if not submit_ip or ":" in submit_ip:
+        sys.exit(
+            f"error: submit node has no FABNet IPv4 (got {submit_ip!r}); "
+            "run --reconfigure first"
+        )
+    print(
+        f"==> installing the studio container on '{args.submit_node}' "
+        f"({args.studio_image})"
+    )
+
+    submit.execute(
+        "command -v docker >/dev/null 2>&1 || "
+        "{ sudo apt-get update -y && sudo apt-get install -y docker.io; }; "
+        "sudo usermod -aG docker $(id -un)"
+    )
+    submit.execute(f"sudo docker pull -q {args.studio_image}")
+
+    # passwd/group shims: the image's own files + the host uid-1000 identity.
+    submit.execute(
+        "mkdir -p ~/.studio ~/.condor/tokens.d && "
+        "chmod 700 ~/.condor ~/.condor/tokens.d"
+    )
+    submit.execute(
+        f"sudo docker run --rm --entrypoint cat {args.studio_image} /etc/passwd "
+        "> ~/.studio/container-passwd && "
+        f"sudo docker run --rm --entrypoint cat {args.studio_image} /etc/group "
+        "> ~/.studio/container-group && "
+        "grep -q '^ubuntu:' ~/.studio/container-passwd || "
+        "echo 'ubuntu:x:1000:1000::/home/ubuntu:/bin/bash' >> ~/.studio/container-passwd; "
+        "grep -q '^ubuntu:' ~/.studio/container-group || "
+        "echo 'ubuntu:x:1000:' >> ~/.studio/container-group"
+    )
+
+    # IDTOKEN: minted by root (only root reads the pool signing key), owned by
+    # the user. TRUST_DOMAIN doubles as _CONDOR_SCHEDD_HOST — the container
+    # never resolves it, the collector lookup returns the schedd's address.
+    out, _ = submit.execute("condor_config_val TRUST_DOMAIN", quiet=True)
+    trust_domain = (out or "").strip().splitlines()[-1] if out else ""
+    if not trust_domain:
+        sys.exit("error: condor_config_val TRUST_DOMAIN returned nothing — condor up?")
+    submit.execute(
+        f"sudo condor_token_create -identity ubuntu@{trust_domain} "
+        "> ~/.condor/tokens.d/studio && chmod 600 ~/.condor/tokens.d/studio"
+    )
+
+    submit.execute("sudo docker rm -f studio >/dev/null 2>&1 || true")
+    submit.execute(
+        "sudo docker run -d --name studio --restart unless-stopped --network host "
+        "-u 1000:1000 -e HOME=/home/ubuntu -e USER=ubuntu "
+        f"-e STUDIO_ALLOWED_ORIGINS={args.studio_origins} "
+        f"-e _CONDOR_CONDOR_HOST={submit_ip} "
+        f"-e _CONDOR_SCHEDD_HOST={trust_domain} "
+        "-e _CONDOR_SEC_TOKEN_DIRECTORY=/home/ubuntu/.condor/tokens.d "
+        "-v /home/ubuntu:/home/ubuntu "
+        "-v /home/ubuntu/.studio/container-passwd:/etc/passwd:ro "
+        "-v /home/ubuntu/.studio/container-group:/etc/group:ro "
+        f"{args.studio_image}"
+    )
+
+    # Verify the two things that break silently: uid resolution and condor auth.
+    out, _ = submit.execute(
+        "sleep 3; sudo docker exec studio whoami; "
+        "sudo docker exec studio condor_q 2>&1 | tail -2",
+        quiet=True,
+    )
+    out = out or ""
+    if "ubuntu" not in out:
+        print(out)
+        sys.exit("error: uid 1000 does not resolve to 'ubuntu' in the container")
+    if "AUTHENTICATE" in out:
+        print(out)
+        sys.exit(
+            "error: condor_q from the container failed to authenticate — check "
+            "IDTOKENS in SEC_DEFAULT_AUTHENTICATION_METHODS and the token"
+        )
+    print("  studio container up: whoami=ubuntu, condor_q authenticates (IDTOKEN)")
+    print(
+        "  reach it from your machine:\n"
+        "    ssh -F ~/.ssh/fabric-submit.conf -L 8888:localhost:8888 fabric-submit\n"
+        "    open http://localhost:8888"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Wire Vector to the Elasticsearch slice
 # ---------------------------------------------------------------------------
 
@@ -761,6 +1199,15 @@ def wire_es(slice_obj, args):
         )
     submit.upload_file(str(ca), "ca.crt")
     submit.execute("sudo install -D -m 0644 ~/ca.crt /etc/vector/ca.crt")
+
+    # A rebuilt pool has no /etc/hosts entry for the ES hostname until the ES
+    # recipe's --peer-slice is re-run; --es-ip is the one-node shortcut (same
+    # grep-guarded append wire_peer uses).
+    if args.es_ip:
+        submit.execute(
+            f"grep -q '{args.es_host}' /etc/hosts || "
+            f"echo '{args.es_ip} {args.es_host}' | sudo tee -a /etc/hosts >/dev/null"
+        )
 
     # The bootstrap rendered /etc/vector/vector.toml with ES_HOST already; re-seds
     # only if the operator overrides --es-host now.
@@ -815,6 +1262,7 @@ def _plan_and_monitor(
     wfevents_condor_poll=False,
     wfevents_join_timeout=60.0,
     serve=True,
+    env_prefix="",
 ):
     """Plan+submit wf_file from workdir into runs/submit/<run_name>, then monitor.
 
@@ -843,6 +1291,9 @@ def _plan_and_monitor(
     pegasus.monitord.plugins.wfevents.join_timeout=wfevents_join_timeout:
     the host's default stop() budget (10s) is below the worst-case flush
     (~42s), and wfevents >=0.3.0 skips the final polls that do not fit it.
+
+    env_prefix is a shell prefix (see _pegasus_env_prefix) that puts a
+    --install-pegasus-wheel install first on PATH for planning and monitoring.
 
     serve=False skips the headless workflow-monitor --serve daemon entirely:
     no workflow-events.jsonl is written, so nothing from the run reaches ES
@@ -898,7 +1349,8 @@ def _plan_and_monitor(
             f"printf '{block}' >> pegasus.properties"
         )
     out, _ = submit.execute(
-        f"cd {workdir} && rm -rf {sub_dir} && "
+        f"{env_prefix}cd {workdir} && rm -rf {sub_dir} && "
+        'echo "  planner: $(command -v pegasus-plan) ($(pegasus-version))"; '
         "pegasus-plan --conf pegasus.properties "
         f"--dir {runs}/submit --relative-submit-dir {run_name} "
         "--sites condorpool --output-sites local --cleanup leaf "
@@ -911,7 +1363,7 @@ def _plan_and_monitor(
         submit.execute(
             # ~/.local/bin (pip --user install of workflow-monitor) is not on PATH for
             # non-interactive SSH (Ubuntu's .bashrc early-returns), so make it explicit.
-            'export PATH="$HOME/.local/bin:$PATH"; '
+            f'{env_prefix}export PATH="$HOME/.local/bin:$PATH"; '
             # pegasus-monitord creates the stampede DB a few seconds AFTER submit, and
             # workflow-monitor --serve exits immediately if it is not there yet. Wait
             # for it (up to ~60s) before launching the monitor.
@@ -957,7 +1409,8 @@ def run_example(slice_obj, args):
     # Generate the abstract workflow + catalogs in the runs dir; diamond.py sets
     # condorio itself, so _plan_and_monitor's guard leaves it intact.
     submit.execute(
-        f"cd {runs} && python3 ~/{REMOTE_DIR}/examples/diamond.py 2>&1 | tail -30"
+        f"{_pegasus_env_prefix(args)}cd {runs} && "
+        f"python3 ~/{REMOTE_DIR}/examples/diamond.py 2>&1 | tail -30"
     )
     sub_dir = _plan_and_monitor(
         submit,
@@ -972,6 +1425,7 @@ def run_example(slice_obj, args):
         wfevents_condor_poll=args.wfevents_condor_poll,
         wfevents_join_timeout=args.wfevents_join_timeout,
         serve=args.serve_monitor,
+        env_prefix=_pegasus_env_prefix(args),
     )
     print(_watch_hint(sub_dir))
 
@@ -1012,7 +1466,7 @@ def run_workflow(slice_obj, args):
     if args.generate_cmd:
         print(f"==> generating workflow: {args.generate_cmd}")
         out, _ = submit.execute(
-            'export PATH="$HOME/.local/bin:$PATH"; '
+            f'{_pegasus_env_prefix(args)}export PATH="$HOME/.local/bin:$PATH"; '
             f"cd {workdir} && {args.generate_cmd} 2>&1 | tail -30"
         )
         print(out)
@@ -1034,6 +1488,7 @@ def run_workflow(slice_obj, args):
         wfevents_condor_poll=args.wfevents_condor_poll,
         wfevents_join_timeout=args.wfevents_join_timeout,
         serve=args.serve_monitor,
+        env_prefix=_pegasus_env_prefix(args),
     )
     print(_watch_hint(sub_dir))
 
@@ -1121,12 +1576,24 @@ def parse_args(argv=None):
     p.add_argument("--worker-cores", type=int, default=8)
     p.add_argument("--worker-ram", type=int, default=32, help="GB")
     p.add_argument("--worker-disk", type=int, default=50, help="GB (root disk)")
-    p.add_argument("--image", default="default_ubuntu_22")
+    p.add_argument(
+        "--image",
+        default="default_ubuntu_24",
+        help="node image; the Pegasus development/6.0 debs need Ubuntu 24 "
+        "(noble-only dists, libc6 >= 2.38)",
+    )
 
     p.add_argument(
         "--bootstrap",
         action="store_true",
         help="install + configure HTCondor pool, Pegasus, workflow-monitor, Vector",
+    )
+    p.add_argument(
+        "--rebootstrap",
+        action="store_true",
+        help="re-run the role-aware node bootstrap on every node of the "
+        "EXISTING slice (idempotent — installed steps are skipped). The "
+        "recovery path when a fresh --bootstrap died partway",
     )
     p.add_argument(
         "--pool-password",
@@ -1140,7 +1607,18 @@ def parse_args(argv=None):
         "from the major: 25.12.2 -> 25.x); default: latest in the 24.x channel",
     )
     p.add_argument(
-        "--pegasus-version", default="5.1.2", help="Pegasus apt version (best-effort)"
+        "--pegasus-version",
+        default=None,
+        help="pin a Pegasus apt version within the channel (best-effort, prefix-"
+        "matched). Default: UNPINNED — track the channel's latest, like the "
+        "studio-webapp :main image does (host/container Pegasus skew breaks runs)",
+    )
+    p.add_argument(
+        "--pegasus-channel",
+        default="development/6.0",
+        help="Pegasus apt channel under download.pegasus.isi.edu: 'release' "
+        "(stable top-level repo) or a subdir like development/6.0 "
+        "(noble/resolute dists only)",
     )
     p.add_argument(
         "--workflow-monitor-spec",
@@ -1166,8 +1644,33 @@ def parse_args(argv=None):
         help="path to the ES slice CA (deploy/fabric/ca.crt)",
     )
     p.add_argument(
+        "--es-ip",
+        default=None,
+        help="with --wire-es: also map --es-host to this FABNet IP in /etc/hosts "
+        "on the submit node (a rebuilt pool has no entry until the ES recipe's "
+        "--peer-slice re-runs)",
+    )
+    p.add_argument(
         "--ingest-password",
         default=os.environ.get("ELASTIC_INGEST_PASSWORD", "changeme-vector-ingest"),
+    )
+
+    # PegasusAI Studio webapp container (post-hoc; the pool must be up).
+    p.add_argument(
+        "--install-studio",
+        action="store_true",
+        help="run the PegasusAI Studio webapp container on the submit node: "
+        "docker + image, passwd/group shims, IDTOKEN into the pool. Idempotent "
+        "(recreates the container; ~/.studio state survives)",
+    )
+    p.add_argument(
+        "--studio-image", default=STUDIO_IMAGE, help="studio container image"
+    )
+    p.add_argument(
+        "--studio-origins",
+        default="http://localhost:8888",
+        metavar="ORIGINS",
+        help="STUDIO_ALLOWED_ORIGINS for the webapp (the ssh -L tunnel origin)",
     )
 
     p.add_argument(
@@ -1252,6 +1755,66 @@ def parse_args(argv=None):
         metavar="DIR",
         help="local pegasus checkout to upload the 3 monitord plugin files from, "
         "instead of fetching --pegasus-plugin-ref from GitHub (iteration loop)",
+    )
+    p.add_argument(
+        "--install-pegasus-wheel",
+        action="store_true",
+        help="build the pegasus-wms wheel on the submit node with `make build` "
+        "(the pegasus repo's developer-guide method) and install that one "
+        "wheel into --pegasus-env on every node, next to the apt Pegasus. "
+        "Needs --pegasus-wheel-ref or --pegasus-wheel-src. Runs started by "
+        "this provisioner then prefer the wheel (deploy/PEGASUS-HTCONDOR.md)",
+    )
+    p.add_argument(
+        "--pegasus-wheel-ref",
+        default=None,
+        metavar="REF",
+        help="with --install-pegasus-wheel: branch or tag to clone from "
+        "--pegasus-wheel-repo (e.g. GH-2270)",
+    )
+    p.add_argument(
+        "--pegasus-wheel-repo",
+        default=PEGASUS_REPO_URL,
+        metavar="URL",
+        help=f"with --pegasus-wheel-ref: git URL to clone (default {PEGASUS_REPO_URL})",
+    )
+    p.add_argument(
+        "--pegasus-wheel-src",
+        default=None,
+        metavar="DIR",
+        help="with --install-pegasus-wheel: local pegasus checkout instead of a "
+        "ref; its COMMITTED HEAD is git-archived and built on the submit node",
+    )
+    p.add_argument(
+        "--pegasus-env",
+        default="/opt/pegasus-env",
+        metavar="DIR",
+        help="install prefix (venv) for --install-pegasus-wheel; must be "
+        "world-readable because worker jobs run as 'nobody' "
+        "(default /opt/pegasus-env)",
+    )
+    p.add_argument(
+        "--pegasus-wheel-worker-package",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --install-pegasus-wheel: set pegasus.transfer.worker.package "
+        "= true in the submit node's ~/.pegasusrc so jobs carry the wheel's "
+        "worker package (a dev build has none on download.pegasus.isi.edu)",
+    )
+    p.add_argument(
+        "--install-pegasus-monitor",
+        action="store_true",
+        help="overlay the pegasus-monitor CLI (Pegasus/monitor/ + cli shim + "
+        "/usr/bin wrapper) onto the submit node's apt Pegasus from "
+        "--pegasus-monitor-src; idempotent, independent of the monitord overlay",
+    )
+    p.add_argument(
+        "--pegasus-monitor-src",
+        default=None,
+        metavar="DIR",
+        help="local pegasus checkout/worktree on a feature/pegasus-monitor* branch; "
+        "its COMMITTED HEAD is git-archived and uploaded (required with "
+        "--install-pegasus-monitor)",
     )
     p.add_argument(
         "--monitord-adapter-spec",
@@ -1354,16 +1917,36 @@ def main(argv=None):
         or args.install_apptainer
         or args.install_monitord_plugin
         or args.install_wfevents_plugin
+        or args.install_pegasus_monitor
+        or args.install_pegasus_wheel
+        or args.install_studio
+        or args.rebootstrap
     ):
         slice_obj = fablib.get_slice(args.name)
+        if args.rebootstrap:
+            _, submit_ip, _ = _node_fabnet(slice_obj, args.submit_node)
+            if submit_ip is None or ":" in submit_ip:
+                sys.exit(
+                    f"error: submit node has no FABNet IPv4 (got {submit_ip!r}); "
+                    "run --reconfigure first"
+                )
+            bootstrap_pool(
+                slice_obj, submit_ip, _fabnet_cidr(slice_obj, submit_ip), args
+            )
         if args.install_apptainer:
             install_apptainer(slice_obj, args)
         if args.install_monitord_plugin:
             install_monitord_plugin(slice_obj, args)
         if args.install_wfevents_plugin:
             install_wfevents_plugin(slice_obj, args)
+        if args.install_pegasus_wheel:
+            install_pegasus_wheel(slice_obj, args)
+        if args.install_pegasus_monitor:
+            install_pegasus_monitor(slice_obj, args)
         if args.wire_es:
             wire_es(slice_obj, args)
+        if args.install_studio:
+            install_studio(slice_obj, args)
         if args.run_example:
             run_example(slice_obj, args)
         if args.run_workflow:
@@ -1404,6 +1987,8 @@ def main(argv=None):
 
     if args.bootstrap:
         bootstrap_pool(slice_obj, submit_ip, fabnet_cidr, args)
+        if args.install_pegasus_wheel:
+            install_pegasus_wheel(slice_obj, args)
 
     print_handoff(args, submit_ip)
 
